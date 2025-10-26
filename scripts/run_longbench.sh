@@ -1,0 +1,1 @@
+python run_longbench.py --model_name gemma_2_2b --attn_implementation sdpa --method dhsa --budget_prefill 2048 --block_size 128 --dhsa_boundary_window_size 4 --dhsa_use_nms --dhsa_nms_window_size 8 --dhsa_chunk_repre_pooling avgpool_norm --dhsa_share_boundaries --dhsa_ckpt_path boundary_predictor_weights/boundary_predictor_gemma2.pt

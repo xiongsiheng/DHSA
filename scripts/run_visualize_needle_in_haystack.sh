@@ -1,0 +1,2 @@
+# python visualize_needle_in_haystack.py --NIAH_folder_path <path_to_NIAH_folder> --model_name gemma_2_2b --budget_prefill 1024 --method dhsa
+python visualize_needle_in_haystack.py --NIAH_folder_path results/gemma_2_2b_dhsa_budget_prefill_1024 --model_name gemma_2_2b --budget_prefill 1024 --method dhsa
