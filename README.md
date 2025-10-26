@@ -14,6 +14,12 @@ This repository contains the official implementation of Long-Context Modeling wi
 
 LLMs face efficiency limits from the quadratic cost of dense attention. Static sparse methods (e.g., sliding windows, global tokens) reduce computation but cannot adapt to content, while dynamic ones still rely on heuristics. DHSA is a data-driven plug-in that predicts attention sparsity on the fly without retraining. It adaptively segments input into variable-length chunks, computes chunk-level similarities, and refines them into token-level importance scores for efficient long-context modeling.
 
+<br>
+<p align="center">
+  <img src='https://raw.githubusercontent.com/xiongsiheng/DHSA/main/misc/Framework.png' width=650>
+</p>
+<br>
+
 ## Key Features
 
 * **Dynamic Boundary Prediction** – Learns to segment input sequences into variable-length chunks based on semantic shifts.
@@ -22,11 +28,11 @@ LLMs face efficiency limits from the quadratic cost of dense attention. Static s
 
 * **Plug-and-Play Integration** – Works with existing Transformer layers without retraining base weights.
 
-
+<br>
 <p align="center">
   <img src='https://raw.githubusercontent.com/xiongsiheng/DHSA/main/misc/NIAH_gemma2.png' width=650>
 </p>
-
+<br>
 
 Latency and Memory Comparison (Gemma2-2B, a single 24 GB GPU)
 
