@@ -69,11 +69,16 @@ DHSA/
 ## Installation
 
 ```bash
+# Clone the repository
 git clone https://github.com/xiongsiheng/DHSA.git
 cd DHSA
 
+# Create and activate a conda environment with Python 3.12
+conda create -n dhsa python=3.12 -y
+conda activate dhsa
+
 # Install dependencies
-pip install -r Requirements.txt
+pip install -r requirements.txt
 ```
 
 
