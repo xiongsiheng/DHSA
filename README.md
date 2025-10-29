@@ -1,6 +1,6 @@
 # DHSA: Dynamic Hierarchical Sparse Attention
 
-This repository contains the official implementation of Long-Context Modeling with Dynamic Hierarchical Sparse Attention for On-Device LLMs.
+This repository contains the official implementation of [Long-Context Modeling with Dynamic Hierarchical Sparse Attention for On-Device LLMs](https://arxiv.org/pdf/2510.24606).
 
 ## Table of Contents
 - [Overview](#overview)
@@ -135,3 +135,17 @@ bash scripts/run_eval_longbench_res.sh
 
 ## Contact
 If you have any inquiries, please feel free to raise an issue or reach out to sxiong45@gatech.edu.
+
+
+## Citation
+```
+@misc{xiong2025longcontextmodelingdynamichierarchical,
+      title={Long-Context Modeling with Dynamic Hierarchical Sparse Attention for On-Device LLMs}, 
+      author={Siheng Xiong and Joe Zou and Faramarz Fekri and Yae Jee Cho},
+      year={2025},
+      eprint={2510.24606},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2510.24606}, 
+}
+```
