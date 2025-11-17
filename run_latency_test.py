@@ -14,7 +14,7 @@ import time
 torch._dynamo.config.disable = True
 
 from utils.config import *  # NEEDLE, DATA_DIR, RETRIEVAL_QUESTION, CONTEXT_LENGTHS_LATENCY_TEST, etc.
-from utils.monkeypatch import replace_gemma, _configure_attention_layers
+from utils.monkeypatch import replace_gemma, _configure_attention_layers, apply_patch_to_generation
 from boundary_predictor.models import BoundarySimilarityAttn
 
 # argparse-based flags
@@ -108,6 +108,9 @@ class LLMLatencyTester:
             print(f"Loading model from: {model_path}")
 
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
+
+        # Apply monkey patch to generation sampling method for latency and peak memory measurement
+        apply_patch_to_generation()
 
         if self.method == SparseAttnMethod.full.value:
             self.model = self._load_full_model(model_path)
@@ -216,7 +219,7 @@ class LLMLatencyTester:
             )
         test_end_time = time.time()
 
-        print('Latency (s): ', test_end_time - test_start_time)
+        print('Total latency (s): ', test_end_time - test_start_time)
 
         response = self.tokenizer.decode(
             output_ids[0][input_ids.shape[1]:],
