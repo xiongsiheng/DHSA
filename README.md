@@ -139,13 +139,9 @@ If you have any inquiries, please feel free to raise an issue or reach out to sx
 
 ## Citation
 ```
-@misc{xiong2025longcontextmodelingdynamichierarchical,
-      title={Long-Context Modeling with Dynamic Hierarchical Sparse Attention for On-Device LLMs}, 
-      author={Siheng Xiong and Joe Zou and Faramarz Fekri and Yae Jee Cho},
-      year={2025},
-      eprint={2510.24606},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2510.24606}, 
+@inproceedings{xiong2025long,
+  title={Long-Context Modeling with Dynamic Hierarchical Sparse Attention for On-Device LLMs},
+  author={Xiong, Siheng and Zou, Joe and Fekri, Faramarz and Cho, Yae Jee},
+  booktitle={NeurIPS 2025 Workshop on Efficient Reasoning}
 }
 ```
