@@ -1,59 +1,99 @@
-"""
-Visualize the results of needle in a haystack (NIAH) tests
-"""
+"""visualize the results of needle in a haystack tests."""
 
-import io
+import argparse
+import glob
 import json
-from pathlib import Path
+import os
 
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 
-from utils.config import *  # RESULTS_DIR, RETRIEVAL_ANSWER, PRETRAINED_LENS, Model, etc.
-from utils.flags_config import get_args  # argparse-based flags
+
+def find_json_files(folder_path):
+    """Return result JSON files from a directory or glob-like prefix."""
+    if os.path.isdir(folder_path):
+        pattern = os.path.join(folder_path, "*.json")
+    else:
+        pattern = f"{folder_path}*.json"
+    return sorted(glob.glob(pattern))
+
+
+def score_from_response(json_data):
+    saved_score = json_data.get("score", json_data.get("Score"))
+    if saved_score is not None:
+        score = float(saved_score)
+        return score / 10 if score > 1 else score
+
+    model_response = json_data.get("model_response", "").lower()
+    expected_answer = (
+        "eat a sandwich and sit in Dolores Park on a sunny day."
+        .lower()
+        .split()
+    )
+
+    return (
+        len(set(model_response.split()).intersection(set(expected_answer)))
+        / len(set(expected_answer))
+    )
 
 
 def main():
-    # Parse CLI args (argparse)
-    args = get_args()
+    parser = argparse.ArgumentParser(
+        description="Generate needle-in-haystack heatmap visualization"
+    )
+    parser.add_argument(
+        "--folder_path",
+        type=str,
+        required=True,
+        help="Path to the directory containing JSON results",
+    )
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        required=True,
+        help="Name of the model being evaluated",
+    )
+    parser.add_argument(
+        "--method_name",
+        type=str,
+        default="full attention",
+        help='Method name for the visualization (default: "full attention")',
+    )
+    parser.add_argument(
+        "--density",
+        type=float,
+        default=None,
+        help="Density value to show in the figure title",
+    )
 
-    # Use the arguments
-    FOLDER_PATH = args.NIAH_folder_path
-    MODEL_NAME = args.model_name
-    PRETRAINED_LEN = PRETRAINED_LENS[Model[MODEL_NAME]]
-    BUDGET_PREFILL = args.budget_prefill
-    BUDGET_DECODE = args.budget_decode
-    METHOD_NAME = args.method
+    args = parser.parse_args()
 
-    print(f"model_name = {MODEL_NAME}")
+    folder_path = args.folder_path
+    model_name = args.model_name
+    method_name = args.method_name
+    density = args.density
 
-    # Find all json files in the directory
-    results_dir = Path(RESULTS_DIR) / FOLDER_PATH
-    json_files = sorted(results_dir.glob("*.json"))
+    print("model_name = %s" % model_name)
 
-    # Collect rows
+    json_files = find_json_files(folder_path)
+
+    if not json_files:
+        raise FileNotFoundError(
+            f"No JSON result files found under {folder_path!r}. "
+            "Pass a directory containing *_results.json files."
+        )
+
     data = []
-    expected_answer_tokens = set(RETRIEVAL_ANSWER.lower().split())
 
-    for file_path in json_files:
-        try:
-            with file_path.open("r", encoding="utf-8") as f:
-                json_data = json.load(f)
-        except Exception as e:
-            print(f"Failed to read {file_path}: {e}")
-            continue
+    for file in json_files:
+        with open(file, "r") as f:
+            json_data = json.load(f)
 
-        # Extract fields
         document_depth = json_data.get("depth_percent", None)
         context_length = json_data.get("context_length", None)
-        model_response = (json_data.get("model_response", "") or "").lower()
-
-        # Simple token-overlap score with expected answer
-        resp_tokens = set(model_response.split())
-        denom = len(expected_answer_tokens) or 1
-        score = len(resp_tokens.intersection(expected_answer_tokens)) / denom
+        score = score_from_response(json_data)
 
         data.append(
             {
@@ -63,30 +103,11 @@ def main():
             }
         )
 
-    if not data:
-        print(f"No JSON files found or parsed in {results_dir}. Nothing to plot.")
-        return
-
-    # DataFrame
-    df = pd.DataFrame(data).dropna(subset=["Document Depth", "Context Length", "Score"])
-
-    # Sort unique context lengths
-    locations = sorted(df["Context Length"].unique())
-
-    # Find column index for the pretrained length threshold
-    pretrained_len_idx = 0
-    for i, l in enumerate(locations):
-        if l > PRETRAINED_LEN:
-            pretrained_len_idx = i
-            break
-    else:
-        # If none are greater, place line after the last column
-        pretrained_len_idx = len(locations) - 1
+    df = pd.DataFrame(data)
 
     print(df.head())
-    print(f"Overall score {df['Score'].mean():.3f}")
+    print("Overall score %.3f" % df["Score"].mean())
 
-    # Pivot for heatmap
     pivot_table = (
         pd.pivot_table(
             df,
@@ -95,16 +116,20 @@ def main():
             aggfunc="mean",
         )
         .reset_index()
-        .pivot(index="Document Depth", columns="Context Length", values="Score")
+        .pivot(
+            index="Document Depth",
+            columns="Context Length",
+            values="Score",
+        )
     )
 
-    # Custom colormap
     cmap = LinearSegmentedColormap.from_list(
-        "custom_cmap", ["#F0496E", "#EBB839", "#0CD79F"]
+        "custom_cmap",
+        ["#F0496E", "#EBB839", "#0CD79F"],
     )
 
-    # Heatmap
     plt.figure(figsize=(38, 8))
+
     sns.heatmap(
         pivot_table,
         vmin=0,
@@ -116,11 +141,16 @@ def main():
         linestyle="--",
     )
 
+    if density is None:
+        density_text = ""
+    else:
+        density_text = f" Density {density}"
+
     title = (
-        f"Pressure Testing {MODEL_NAME} {METHOD_NAME} "
-        f"Budget Prefill {BUDGET_PREFILL} Budget Decode {BUDGET_DECODE}\n"
-        "Fact Retrieval Across Context Lengths (Needle In A Haystack)"
+        f'Pressure Testing {model_name} {method_name}{density_text}\n'
+        'Fact Retrieval Across Context Lengths ("Needle In A HayStack")'
     )
+
     plt.title(title, fontsize=18)
     plt.xlabel("Token Limit", fontsize=18)
     plt.ylabel("Depth Percent", fontsize=18)
@@ -128,18 +158,23 @@ def main():
     plt.yticks(rotation=0, fontsize=18)
     plt.tight_layout()
 
-    # Vertical line at pretrained context length (approx by column index)
-    plt.axvline(x=pretrained_len_idx + 0.8, color="white", linestyle="--", linewidth=4)
+    # Save to sibling img/ directory of the top-level results folder.
+    folder_path_norm = os.path.normpath(folder_path)
 
-    # Save
-    out_dir = Path(RESULTS_DIR) / "img"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    save_path = out_dir / f"{MODEL_NAME}.png"
-    print(f"saving at {save_path}")
+    if os.path.isdir(folder_path_norm):
+        result_dir = folder_path_norm
+    else:
+        result_dir = os.path.dirname(folder_path_norm)
 
-    buffer = io.BytesIO()
-    plt.savefig(buffer, format="png", dpi=150)
-    save_path.write_bytes(buffer.getvalue())
+    parent_dir = os.path.dirname(os.path.dirname(result_dir))
+    img_dir = os.path.join(parent_dir, "img")
+
+    os.makedirs(img_dir, exist_ok=True)
+
+    save_path = os.path.join(img_dir, f"{model_name}.png")
+    print("saving at %s" % save_path)
+
+    plt.savefig(save_path, dpi=150)
 
 
 if __name__ == "__main__":

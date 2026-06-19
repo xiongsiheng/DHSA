@@ -1,0 +1,13 @@
+CUDA_VISIBLE_DEVICES=0 python run_needle_in_haystack.py \
+  --model_name meta-llama/Llama-3.1-8B-Instruct \
+  --use_quant \
+  --max-new-tokens 15 \
+  --density 0.125 \
+  --sparsity-mask DHSA_vs  \
+  --q-block-size 128 \
+  --k-block-size 32 \
+  --save_results \
+  --save_contexts \
+  --report-latency \
+  --use_cache true \
+  --save_dir results_NIAH

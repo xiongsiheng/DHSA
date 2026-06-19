@@ -1,0 +1,12 @@
+CUDA_VISIBLE_DEVICES=0 python run_longbench.py \
+  --model_name meta-llama/Llama-3.1-8B-Instruct \
+  --use_quant \
+  --model_max_length 32768 \
+  --density 0.125 \
+  --sparsity_mask DHSA_vs \
+  --q-block-size 128 \
+  --k-block-size 32 \
+  --eval_batch_size 1 \
+  --save_dir results_longbench \
+  --report-latency \
+  --verbose

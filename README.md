@@ -1,68 +1,44 @@
 # DHSA: Dynamic Hierarchical Sparse Attention
 
-This repository contains the official implementation of [Long-Context Modeling with Dynamic Hierarchical Sparse Attention for On-Device LLMs](https://arxiv.org/pdf/2510.24606).
+<p align="center">
+  <img src="https://raw.githubusercontent.com/xiongsiheng/DHSA/main/misc/Performance_overview.png" width="800">
+</p>
+
+This repository contains the official implementation of **[ICML 26 Spotlight, NeurIPS 25 Efficient Reasoning Workshop]** paper [Long-Context Modeling with Dynamic Hierarchical Sparse Attention for Memory-Constrained LLM Inference](https://arxiv.org/pdf/2510.24606).
 
 ## Table of Contents
+
 - [Overview](#overview)
-- [Key Features](#key-features)
 - [Repository Structure](#repository-structure)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
-
+- [Acknowledgements](#acknowledgements)
 
 ## Overview
 
-LLMs face efficiency limits from the quadratic cost of dense attention. Static sparse methods (e.g., sliding windows, global tokens) reduce computation but cannot adapt to content, while dynamic ones still rely on heuristics. DHSA is a data-driven plug-in that predicts attention sparsity on the fly without retraining. It adaptively segments input into variable-length chunks, computes chunk-level similarities, and refines them into token-level importance scores for efficient long-context modeling.
-
-<br>
 <p align="center">
-  <img src='https://raw.githubusercontent.com/xiongsiheng/DHSA/main/misc/Framework.png' width=650>
+  <img src='https://raw.githubusercontent.com/xiongsiheng/DHSA/main/misc/Framework_v2.png' width=650>
 </p>
-<br>
 
-## Key Features
-
-* **Dynamic Boundary Prediction** – Learns to segment input sequences into variable-length chunks based on semantic shifts.
-
-* **Hierarchical Sparsity Prediction** – Combines chunk-level and token-level attention estimation for efficient long-context modelling.
-
-* **Plug-and-Play Integration** – Works with existing Transformer layers without retraining base weights.
-
-<br>
-<p align="center">
-  <img src='https://raw.githubusercontent.com/xiongsiheng/DHSA/main/misc/NIAH_gemma2.png' width=650>
-</p>
-<br>
-
-Latency and Memory Comparison (Gemma2-2B, a single 24 GB GPU)
-
-| Context Length | Method | Prefill Latency (s) | Prefill Peak Memory (GB) |
-|----------------|---------|--------------|------------------|
-| 8k  | Dense | 1.65 | 10.72 |
-|          | **DHSA** | **1.19** | **6.91** |
-| 16k | Dense | - | OOM |
-|          | **DHSA** | **2.18** | **9.69** |
-| 32k | Dense | - | OOM |
-|          | **DHSA** | **4.51** | **16.99** |
-
-*DHSA uses a 2k attention budget with a query chunk size of 256.*
-
+LLMs face efficiency limits from the quadratic cost of dense attention. Static sparse methods (e.g., sliding windows, global tokens) reduce computation but cannot adapt to content. DHSA is a data-driven plugin that predicts attention sparsity on the fly without retraining the base model. By extending [Block-Sparse Attention](https://github.com/mit-han-lab/Block-Sparse-Attention) to support variable-sized query and key blocks, DHSA better preserves accuracy under highly sparse regimes.
 
 ## Repository Structure
 
 ```bash
 DHSA/
-├── boundary_predictor/
-├── boundary_predictor_weights/
+├── Block-Sparse-Attention/
 ├── data/
 ├── results_longbench/
-├── results_needle/
+├── results_NIAH/
+├── results_ruler/
 ├── scripts/
 ├── utils/
 ├── eval_longbench.py
-├── run_latency_test.py
+├── eval_ruler.py
+├── measure_latency.py
 ├── run_longbench.py
 ├── run_needle_in_haystack.py
+├── run_ruler.py
 └── visualize_needle_in_haystack.py
 ```
 
@@ -74,74 +50,104 @@ git clone https://github.com/xiongsiheng/DHSA.git
 cd DHSA
 
 # Create and activate a conda environment with Python 3.12
-conda create -n dhsa python=3.12 -y
-conda activate dhsa
+conda create -n DHSA python=3.12 -y
+conda activate DHSA
+
+pip install torch==2.5.0 --index-url https://download.pytorch.org/whl/cu124
+
+# Build Block-Sparse-Attention kernel
+cd Block-Sparse-Attention
+
+pip install packaging
+pip install ninja
+
+MAX_JOBS=2 NVCC_THREADS=1 \
+BLOCK_SPARSE_ATTN_FORCE_BUILD=TRUE \
+BLOCK_SPARSE_ATTN_FORWARD_ONLY=TRUE \
+BLOCK_SPARSE_ATTN_LLAMA8B_BF16_CAUSAL_ONLY=TRUE \
+BLOCK_SPARSE_ATTN_CUDA_ARCHS=86 \
+python setup.py build_ext --inplace
 
 # Install dependencies
+cd ..
 pip install -r requirements.txt
+pip install flash-attn==2.7.4.post1 --no-build-isolation
 ```
 
-
 ## Quick Start
-
-### Boundary Prediction
-
-You can directly download the predictor weights [here](https://huggingface.co/sxiong/DHSA).
-
-If you wish to train from scratch, you can download the following datasets: [Long Data Collections](https://huggingface.co/datasets/togethercomputer/Long-Data-Collections), [trivia QA](https://huggingface.co/datasets/mandarjoshi/trivia_qa), [ChatQA2](https://huggingface.co/datasets/nvidia/ChatQA2-Long-SFT-data), and use the training scripts provided in `boundary_predictor/`.
 
 ### Needle-in-a-Haystack Test
 
 To evaluate the model's ability to retrieve specific information from a long context, run:
 
 ```bash
-bash scripts/run_needle_in_haystack.sh
+bash scripts/run_needle_in_haystack_llama3.sh
+
+bash scripts/run_needle_in_haystack_llama3_100k.sh
+
+bash scripts/run_needle_in_haystack_qwen2_5.sh
 ```
 
 To visualize the results, run:
 
 ```bash
-bash scripts/run_visualize_needle_in_haystack.sh
+bash scripts/visualize_NIAH_res.sh
 ```
-
-
-### Latency & Memory Comparison
-
-To benchmark latency and memory usage against other methods, run:
-
-```bash
-bash scripts/run_latency_test.sh
-```
-
 
 ### LongBench
 
 To test performance on the comprehensive [LongBench](https://github.com/THUDM/LongBench) suite, run:
 
-
 ```bash
-bash scripts/run_longbench.sh
+bash scripts/run_longbench_llama3.sh
+
+bash scripts/run_longbench_qwen2_5.sh
 ```
-
-
 
 To evaluate the results, run:
 
+```bash
+bash scripts/eval_longbench.sh
+```
+
+### RULER
+
+To evaluate performance on the controlled synthetic [RULER](https://github.com/NVIDIA/RULER) suite, you can either generate the data using the official repository or download our pre-generated [data](https://huggingface.co/datasets/sxiong/DHSA_RULER), then run:
 
 ```bash
-bash scripts/run_eval_longbench_res.sh
+bash scripts/run_ruler_llama3.sh
+
+bash scripts/run_ruler_qwen2_5.sh
 ```
 
+To evaluate the results, run:
 
-## Contact
-If you have any inquiries, please feel free to raise an issue or reach out to sxiong45@gatech.edu.
+```bash
+bash scripts/eval_ruler.sh
+```
 
+### Latency Measurement
+
+To benchmark latency and memory usage against [Flash Attention2](https://github.com/dao-ailab/flash-attention), run:
+
+```bash
+bash scripts/measure_latency.sh
+
+bash scripts/measure_latency_batched.sh
+```
+
+## Acknowledgements
+
+The implementation is built upon [Block-Sparse Attention](https://github.com/mit-han-lab/Block-Sparse-Attention) and [KVCache-Factory](https://github.com/Zefan-Cai/KVCache-Factory).
+We sincerely appreciate these teams for their open-source contributions.
 
 ## Citation
+
 ```
-@inproceedings{xiong2025long,
+@article{xiong2025long,
   title={Long-Context Modeling with Dynamic Hierarchical Sparse Attention for On-Device LLMs},
   author={Xiong, Siheng and Zou, Joe and Fekri, Faramarz and Cho, Yae Jee},
-  booktitle={NeurIPS 2025 Workshop on Efficient Reasoning}
+  journal={arXiv preprint arXiv:2510.24606},
+  year={2025}
 }
 ```
