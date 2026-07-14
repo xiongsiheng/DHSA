@@ -144,10 +144,9 @@ We sincerely appreciate these teams for their open-source contributions.
 ## Citation
 
 ```
-@article{xiong2025long,
-  title={Long-Context Modeling with Dynamic Hierarchical Sparse Attention for On-Device LLMs},
+@inproceedings{xionglong,
+  title={Long-Context Modeling with Dynamic Hierarchical Sparse Attention for Memory-Constrained LLM Inference},
   author={Xiong, Siheng and Zou, Joe and Fekri, Faramarz and Cho, Yae Jee},
-  journal={arXiv preprint arXiv:2510.24606},
-  year={2025}
+  booktitle={Forty-third International Conference on Machine Learning}
 }
 ```
