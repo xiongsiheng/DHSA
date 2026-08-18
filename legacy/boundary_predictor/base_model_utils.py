@@ -10,17 +10,30 @@ from torch.nn.functional import pad
 torch._dynamo.config.disable = True
 
 
-from utils.config import *
-from utils.monkeypatch import replace_gemma, _configure_attention_layers
+from ..utils.config import MODEL_PATHS, Model, SparseAttnMethod
+from ..utils.monkeypatch import replace_gemma, _configure_attention_layers
 
 
 
-def load_labels(model, label_data):
+def load_labels(model, label_data, num_layers: int | None = None):
     """Load labels from file into model to save computation time."""
-    layers = len(model.model.layers)
+    layers = len(model.model.layers) if num_layers is None else num_layers
+    if layers > len(model.model.layers):
+        raise ValueError(f"Requested {layers} layers, but the model has {len(model.model.layers)}")
+
     for i in range(layers):
-        model.model.layers[i].self_attn.ratios = label_data[str(i)]["ratios"]
-        model.model.layers[i].self_attn.boundaries = label_data[str(i)]["boundary"]
+        layer_data = label_data.get(str(i), label_data.get(i))
+        if layer_data is None:
+            raise KeyError(f"Label data is missing layer {i}")
+
+        self_attn = model.model.layers[i].self_attn
+        device = self_attn.q_proj.weight.device
+        self_attn.preloaded_ratios = torch.as_tensor(
+            layer_data["ratios"], device=device, dtype=torch.float32
+        )
+        self_attn.preloaded_boundaries = torch.as_tensor(
+            layer_data["boundary"], device=device, dtype=torch.long
+        )
 
 
 def setup_lm_and_tokenizer(args, tokenizer_only=False):
@@ -52,9 +65,9 @@ def setup_lm_and_tokenizer(args, tokenizer_only=False):
             torch_dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
             device_map="auto",
-            use_cache=args.use_cache,
             attn_implementation=args.attn_implementation
         )
+        lm.config.use_cache = args.use_cache
 
         # Configure model layers
         _configure_attention_layers(args, lm)
@@ -89,7 +102,7 @@ def compute_ppl_with_full_response(
     Returns:
         A tuple of success and loss.
     """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = next(model.parameters()).device
     max_len = tokenizer.model_max_length if max_len is None else max_len
 
     # 1) Tokenize the response alone to find its length

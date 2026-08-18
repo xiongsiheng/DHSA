@@ -903,7 +903,7 @@ def label_boundaries(
         boundary = [i+1 for i in boundary]
 
         # Add start and end boundaries
-        if boundary[0] != 0:
+        if not boundary or boundary[0] != 0:
             boundary = [0] + boundary
         if boundary[-1] != len(position_candidates):
             boundary += [len(position_candidates)]
@@ -913,7 +913,7 @@ def label_boundaries(
 
     # Convert to tensor
     boundaries = torch.tensor(boundaries, device=query_states.device)
-    ratios = torch.tensor(ratios, device=query_states.device)
+    ratios = torch.stack(ratios, dim=0).to(query_states.device)
     return boundaries, ratios
 
 
@@ -975,7 +975,7 @@ def predict_boundaries(
         boundary = [i+1 for i in boundary]
 
         # Add start and end boundaries
-        if boundary[0] != 0:
+        if not boundary or boundary[0] != 0:
             boundary = [0] + boundary
         if boundary[-1] != len(candidates):
             boundary += [len(candidates)]
@@ -1309,6 +1309,10 @@ def dhsa_sdpa(
     # Calculate number of blocks for query and key
     num_q_blocks = (q_len + block_size - 1) // block_size
     num_k_tokens = k_len
+
+    # The CLI uses -1 to mean dense/all available tokens.
+    if topk_tokens < 0:
+        topk_tokens = num_k_tokens
 
     # Ensure the number of selected tokens 
     # is not larger than the sliding window size

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT}/Block-Sparse-Attention"
+
+export BLOCK_SPARSE_ATTN_FORCE_BUILD="${BLOCK_SPARSE_ATTN_FORCE_BUILD:-TRUE}"
+export BLOCK_SPARSE_ATTN_FORWARD_ONLY="${BLOCK_SPARSE_ATTN_FORWARD_ONLY:-TRUE}"
+export BLOCK_SPARSE_ATTN_LLAMA8B_BF16_CAUSAL_ONLY="${BLOCK_SPARSE_ATTN_LLAMA8B_BF16_CAUSAL_ONLY:-TRUE}"
+export BLOCK_SPARSE_ATTN_CUDA_ARCHS="${BLOCK_SPARSE_ATTN_CUDA_ARCHS:-80;86;89}"
+export MAX_JOBS="${MAX_JOBS:-2}"
+export NVCC_THREADS="${NVCC_THREADS:-1}"
+
+python setup.py build_ext --inplace

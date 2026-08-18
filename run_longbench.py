@@ -7,24 +7,32 @@ and saves JSONL predictions with optional latency metrics.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import random
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, TypeVar
 
 import torch
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from utils.helper import FirstTokenTimer, parse_bool, set_seed
-from utils.monkeypatch import SPARSITY_MASKS, configure_DHSA, validate_sparse_config
+from utils.monkeypatch import (
+    ATTENTION_METHODS,
+    configure_DHSA,
+    validate_attention_config,
+)
 
 
 LOCAL_BLOCK_SPARSE_METHOD = "DHSA"
 DEFAULT_BLOCK_SIZE = 128
 DEFAULT_MODEL_MAX_LENGTH = 16384
+T = TypeVar("T")
 
 # Disable torch dynamo for compatibility.
 torch._dynamo.config.disable = True
@@ -35,6 +43,42 @@ DATASETS = [
     "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum",
     "passage_count", "passage_retrieval_en", "lcc", "repobench-p"
 ]
+
+
+def stable_random_sample(
+    items: Sequence[T],
+    sample_size: int,
+    *,
+    seed: int,
+    namespace: str,
+) -> list[T]:
+    """Return a deterministic random sample scoped by seed and namespace."""
+    if sample_size <= 0:
+        raise ValueError("sample_size must be positive")
+    if len(items) <= sample_size:
+        return list(items)
+
+    seed_material = f"{int(seed)}\0{namespace}".encode("utf-8")
+    derived_seed = int.from_bytes(
+        hashlib.sha256(seed_material).digest()[:8],
+        byteorder="big",
+    )
+    return random.Random(derived_seed).sample(list(items), sample_size)
+
+
+def parse_str_list(value: str) -> List[str]:
+    datasets = [item.strip() for item in value.split(",") if item.strip()]
+    if not datasets:
+        raise argparse.ArgumentTypeError(
+            "Expected a comma-separated list of LongBench datasets."
+        )
+    unknown = sorted(set(datasets) - set(DATASETS))
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"Unknown LongBench datasets: {', '.join(unknown)}"
+        )
+    return datasets
+
 
 OUTPUT_MAX_LENGTHS = {
     "narrativeqa": 128,
@@ -171,8 +215,13 @@ TASK_PROMPTS = {
     )
 }
 
-def load_test_data(data_file: str, dataset: str, max_examples: Optional[int] = None, 
-                   sample_method: str = "topk") -> List[Dict[str, Any]]:
+def load_test_data(
+    data_file: str,
+    dataset: str,
+    max_examples: Optional[int] = None,
+    sample_method: str = "topk",
+    sample_seed: int = 42,
+) -> List[Dict[str, Any]]:
     """Load and preprocess test data."""
     test_data = []
     input_max_len = 0
@@ -198,7 +247,12 @@ def load_test_data(data_file: str, dataset: str, max_examples: Optional[int] = N
     # Sample data if needed
     if max_examples and len(test_data) > max_examples:
         if sample_method == "random":
-            test_data = random.sample(test_data, max_examples)
+            test_data = stable_random_sample(
+                test_data,
+                max_examples,
+                seed=sample_seed,
+                namespace=f"longbench:{dataset}",
+            )
         elif sample_method == "topk":
             test_data = test_data[:max_examples]
     
@@ -285,7 +339,12 @@ def setup_model_and_tokenizer(args: argparse.Namespace):
     density = 1.0 - args.sparsity_ratio if args.sparsity_ratio is not None else args.density
     q_block_size = args.q_block_size if args.q_block_size is not None else args.block_size
     k_block_size = args.k_block_size if args.k_block_size is not None else args.block_size
-    validate_sparse_config(density, q_block_size, k_block_size)
+    validate_attention_config(
+        args.sparsity_mask,
+        density,
+        q_block_size,
+        k_block_size,
+    )
 
     model_path = args.model_name
 
@@ -314,6 +373,7 @@ def setup_model_and_tokenizer(args: argparse.Namespace):
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             quantization_config=bnb_config,
+            torch_dtype=torch.bfloat16,
             device_map="auto",
             attn_implementation=args.attn_implementation,
             low_cpu_mem_usage=True,
@@ -322,15 +382,18 @@ def setup_model_and_tokenizer(args: argparse.Namespace):
 
     configure_generation_special_tokens(tokenizer, model)
 
-    configure_DHSA(
-        model,
-        density=density,
-        q_block_size=q_block_size,
-        k_block_size=k_block_size,
-        sparsity_mask=args.sparsity_mask,
-        chunk_calculation=False,
-    )
+    if args.sparsity_mask != "full":
+        configure_DHSA(
+            model,
+            density=density,
+            q_block_size=q_block_size,
+            k_block_size=k_block_size,
+            sparsity_mask=args.sparsity_mask,
+            chunk_calculation=False,
+            predictor_checkpoint=args.predictor_checkpoint,
+        )
 
+    args.method_name = "FA2" if args.sparsity_mask == "full" else LOCAL_BLOCK_SPARSE_METHOD
     args.DHSA_density = float(density)
     args.DHSA_sparsity = 1.0 - float(density)
     args.DHSA_q_block_size = int(q_block_size)
@@ -341,6 +404,23 @@ def setup_model_and_tokenizer(args: argparse.Namespace):
     return model, tokenizer
 
 
+def aligned_prompt_lengths(
+    tokenized_prompts,
+    model_max_len: int,
+    args: argparse.Namespace,
+) -> List[int]:
+    max_len = (model_max_len // args.DHSA_alignment) * args.DHSA_alignment
+    if max_len <= 0:
+        raise ValueError("model_max_len is shorter than one alignment unit.")
+    valid_lengths = tokenized_prompts.attention_mask.sum(dim=-1).clamp(
+        max=max_len
+    )
+    aligned_lengths = (
+        valid_lengths // args.DHSA_alignment
+    ) * args.DHSA_alignment
+    return [int(length) for length in aligned_lengths.tolist()]
+
+
 def align_tokenized_batch(tokenized_prompts, model_max_len: int, args: argparse.Namespace):
     input_ids = tokenized_prompts.input_ids
     attention_mask = tokenized_prompts.attention_mask
@@ -348,20 +428,26 @@ def align_tokenized_batch(tokenized_prompts, model_max_len: int, args: argparse.
     if max_len <= 0:
         raise ValueError("model_max_len is shorter than one alignment unit.")
 
-    if input_ids.shape[-1] > max_len:
-        input_ids = input_ids[:, -max_len:]
-        attention_mask = attention_mask[:, -max_len:]
-
-    seq_len = input_ids.shape[-1]
-    aligned_len = (seq_len // args.DHSA_alignment) * args.DHSA_alignment
+    aligned_lengths = aligned_prompt_lengths(
+        tokenized_prompts,
+        model_max_len,
+        args,
+    )
+    if len(set(aligned_lengths)) != 1:
+        raise ValueError(
+            "A sparse batch may not mix prompts with different aligned "
+            f"lengths: {aligned_lengths}"
+        )
+    aligned_len = aligned_lengths[0]
     if aligned_len <= 0:
         raise ValueError(
             "Prompt is shorter than one sparse block after tokenization; "
             "increase the input length or reduce the block sizes."
         )
-    if aligned_len != seq_len:
-        input_ids = input_ids[:, -aligned_len:]
-        attention_mask = attention_mask[:, -aligned_len:]
+    input_ids = input_ids[:, -aligned_len:]
+    attention_mask = attention_mask[:, -aligned_len:]
+    if not bool(attention_mask.all()):
+        raise ValueError("Aligned sparse batches must not contain padding tokens.")
 
     tokenized_prompts["input_ids"] = input_ids.contiguous()
     tokenized_prompts["attention_mask"] = attention_mask.contiguous()
@@ -382,6 +468,36 @@ def generate_batch_outputs(
         return_tensors="pt",
         add_special_tokens=True,
     )
+    aligned_lengths = aligned_prompt_lengths(
+        tokenized_prompts,
+        model_max_len,
+        args,
+    )
+    if len(set(aligned_lengths)) != 1:
+        batch_outputs = []
+        start = 0
+        while start < len(batch_prompts):
+            end = start + 1
+            while (
+                end < len(batch_prompts)
+                and aligned_lengths[end] == aligned_lengths[start]
+            ):
+                end += 1
+            group_outputs, _ = generate_batch_outputs(
+                model,
+                tokenizer,
+                batch_prompts[start:end],
+                model_max_len,
+                output_max_len,
+                args,
+            )
+            batch_outputs.extend(group_outputs)
+            start = end
+        return batch_outputs, {
+            "ttft_ms": None,
+            "generation_latency_ms": None,
+        }
+
     tokenized_prompts = align_tokenized_batch(tokenized_prompts, model_max_len, args).to("cuda")
     context_length = tokenized_prompts.input_ids.shape[-1]
 
@@ -462,15 +578,58 @@ def build_output_file(args: argparse.Namespace, dataset: str) -> str:
     return os.path.join(output_dir, filename)
 
 
+def load_resume_count(output_file: str, expected_ids: List[Any]) -> int:
+    path = Path(output_file)
+    if not path.exists():
+        return 0
+
+    lines = path.read_bytes().splitlines(keepends=True)
+    records = []
+    valid_bytes = 0
+    for line_idx, line in enumerate(lines):
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            if any(remaining.strip() for remaining in lines[line_idx + 1 :]):
+                raise ValueError(
+                    f"Corrupt non-terminal JSONL record in {output_file} "
+                    f"at line {line_idx + 1}"
+                )
+            with path.open("r+b") as fout:
+                fout.truncate(valid_bytes)
+            break
+        records.append(record)
+        valid_bytes += len(line)
+
+    if len(records) > len(expected_ids):
+        raise ValueError(
+            f"{output_file} contains {len(records)} records, "
+            f"but the dataset has only {len(expected_ids)} examples"
+        )
+    for index, record in enumerate(records):
+        if str(record.get("_id")) != str(expected_ids[index]):
+            raise ValueError(
+                f"Resume prefix mismatch in {output_file} at record {index}: "
+                f"found {record.get('_id')!r}, expected {expected_ids[index]!r}"
+            )
+    return len(records)
+
+
 def evaluate_dataset(model, tokenizer, args: argparse.Namespace, dataset: str) -> None:
     print(
-        f"Evaluating {LOCAL_BLOCK_SPARSE_METHOD} "
+        f"Evaluating {args.method_name} "
         f"density={args.DHSA_density} "
         f"mask={args.sparsity_mask} on {dataset}"
     )
 
-    data_file = f"data/LongBench/{dataset}.jsonl"
-    test_data = load_test_data(data_file, dataset, args.max_num_examples, args.sample_method)
+    data_file = args.data_dir / f"{dataset}.jsonl"
+    test_data = load_test_data(
+        data_file,
+        dataset,
+        args.max_num_examples,
+        args.sample_method,
+        args.seed,
+    )
     data_components = {
         "prompts": [ex["prompt"] for ex in test_data],
         "inputs": [ex["input"] for ex in test_data],
@@ -486,9 +645,31 @@ def evaluate_dataset(model, tokenizer, args: argparse.Namespace, dataset: str) -
     model_max_len = args.model_max_length
     output_max_len = OUTPUT_MAX_LENGTHS[dataset]
     output_file = build_output_file(args, dataset)
+    completed = (
+        load_resume_count(output_file, data_components["ids"])
+        if args.resume
+        else 0
+    )
+    if completed == len(data_components["prompts"]):
+        print(f"Resume: {output_file} already has all {completed} examples")
+        return
+    if completed:
+        print(
+            f"Resume: continuing {output_file} at example "
+            f"{completed}/{len(data_components['prompts'])}"
+        )
 
-    with open(output_file, "w", encoding="utf-8") as fout:
-        for i in tqdm(range(0, len(data_components["prompts"]), args.eval_batch_size)):
+    output_mode = "a" if completed else "w"
+    with open(output_file, output_mode, encoding="utf-8") as fout:
+        progress = tqdm(
+            initial=completed,
+            total=len(data_components["prompts"]),
+        )
+        for i in range(
+            completed,
+            len(data_components["prompts"]),
+            args.eval_batch_size,
+        ):
             batch_data = {
                 key: values[i : i + args.eval_batch_size]
                 for key, values in data_components.items()
@@ -520,8 +701,11 @@ def evaluate_dataset(model, tokenizer, args: argparse.Namespace, dataset: str) -
                 if args.report_latency:
                     result.update(latency_metrics)
                 fout.write(json.dumps(result) + "\n")
+            fout.flush()
+            progress.update(len(batch_outputs))
+        progress.close()
 
-            torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -531,6 +715,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--save_dir", type=str, default="", help="Save directory")
+    parser.add_argument(
+        "--data_dir",
+        type=Path,
+        default=Path("data/LongBench"),
+        help="Directory containing LongBench JSONL files.",
+    )
 
     parser.add_argument("--model_name", type=str, required=True, help="Model name or path")
     parser.add_argument("--use_fast_tokenizer", type=bool, default=True, help="Use fast tokenizer")
@@ -550,6 +740,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--max_num_examples", type=int, default=None, help="Max examples per task")
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Append after a validated existing JSONL prefix instead of overwriting it.",
+    )
+    parser.add_argument(
+        "--datasets",
+        type=parse_str_list,
+        default=DATASETS,
+        help="Comma-separated LongBench datasets to evaluate.",
+    )
+    parser.add_argument(
         "--sample_method",
         type=str,
         default="topk",
@@ -566,8 +767,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--density",
         type=float,
-        default=0.125,
-        help="Fraction of key blocks kept per query block.",
+        default=1.0,
+        help="Fraction of key blocks kept per query block; use 1.0 for full.",
     )
     parser.add_argument(
         "--sparsity_ratio",
@@ -579,11 +780,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--sparsity-mask",
         "--sparsity_mask",
         dest="sparsity_mask",
-        choices=SPARSITY_MASKS,
-        help="Sparse block selection function from the DHSA patch.",
+        choices=ATTENTION_METHODS,
+        default="full",
+        help="Attention method.",
     )
     parser.add_argument("--q-block-size", "--q_block_size", dest="q_block_size", type=int, default=DEFAULT_BLOCK_SIZE, help="Query sparse block size.")
     parser.add_argument("--k-block-size", "--k_block_size", dest="k_block_size", type=int, default=DEFAULT_BLOCK_SIZE, help="Key sparse block size.")
+    parser.add_argument("--predictor-checkpoint", type=Path)
 
     return parser
 
@@ -595,8 +798,8 @@ def main() -> None:
     set_seed(args.seed)
     model, tokenizer = setup_model_and_tokenizer(args)
 
-    for idx, dataset in enumerate(DATASETS):
-        print(f"Processing dataset {dataset} ({idx + 1}/{len(DATASETS)})")
+    for idx, dataset in enumerate(args.datasets):
+        print(f"Processing dataset {dataset} ({idx + 1}/{len(args.datasets)})")
         evaluate_dataset(model, tokenizer, args, dataset)
 
     print("Evaluation completed!")

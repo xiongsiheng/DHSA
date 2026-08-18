@@ -2,6 +2,7 @@
 Preprocessing utilities for boundary predictor training.
 """
 import langdetect
+from langdetect.lang_detect_exception import LangDetectException
 
 
 def is_foreign_language(text, base_language="en"):
@@ -9,8 +10,26 @@ def is_foreign_language(text, base_language="en"):
     try:
         detected_lang = langdetect.detect(text)
         return detected_lang != base_language
-    except:
+    except LangDetectException:
         return False
+
+
+def _join_text(value, separator="\n\n"):
+    """Normalize string or list-valued dataset fields to text."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return separator.join(str(item) for item in value)
+    return str(value)
+
+
+def _first_text(value, field_name):
+    """Return a scalar answer from a string or a non-empty list."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)) and value:
+        return str(value[0])
+    raise ValueError(f"Expected a non-empty string or list in {field_name!r}")
 
 
 def prepare_prompt_and_response(sample, dataset_name):
@@ -22,16 +41,15 @@ def prepare_prompt_and_response(sample, dataset_name):
         prompt = sample["prompt"]
         response = sample["completion"].strip().split("\n")[0]
     elif dataset_name in ["trivia_qa", "trivia_qa_unfiltered"]:
-        context = sample["search_results"]["search_context"]
-        context = "\n\n".join(context)
+        context = _join_text(sample["search_results"]["search_context"])
         prompt = context + "\n\n" + sample["question"]
-        response = sample["answer"]["aliases"][0]
+        response = _first_text(sample["answer"]["aliases"], "answer.aliases")
     elif dataset_name == "nvidia_ChatQA2_Long_SFT_data":
-        prompt = sample["question"]
-        response = sample["answer"]
+        prompt = _join_text(sample["question"])
+        response = _first_text(sample["answer"], "answer")
     elif dataset_name == "nvidia_ChatQA2_Long_SFT_data_NarrativeQA_131072":
-        prompt = sample["sub-paragraphs"] + "\n\n" + sample["question"]
-        response = sample["answer"][0]
+        prompt = _join_text(sample["sub-paragraphs"]) + "\n\n" + _join_text(sample["question"])
+        response = _first_text(sample["answer"], "answer")
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 

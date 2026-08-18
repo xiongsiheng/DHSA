@@ -1,463 +1,480 @@
 #!/usr/bin/env python3
-"""
-Measure kernel-level latency and GPU memory for dense FA2 and DHSA attention.
-
-Loads the model config, generates Q/K/V tensors, and benchmarks
-different context lengths, sparse densities, block sizes, and sparsity masks.
-"""
+"""Benchmark one attention layer's mask construction and attention kernel."""
 
 import argparse
+import json
+import math
+import statistics
+from pathlib import Path
 
 import torch
+from flash_attn import flash_attn_func
 
-from utils.monkeypatch import SPARSITY_MASKS, load_DHSA_patch_module, validate_sparse_config
+from utils.monkeypatch import (
+    ATTENTION_METHODS,
+    load_DHSA_patch_module,
+    validate_sparse_config,
+)
 
 
-_block_sparse_patch = None
-_call_block_sparse_attn_func = None
-
-
-DEFAULT_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
+MODEL_CONFIGS = {
+    "qwen": {
+        "model_name": "Qwen/Qwen2.5-3B-Instruct",
+        "load_mode": "bf16",
+        "num_heads": 16,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+    },
+    "llama": {
+        "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+        "load_mode": "4bit",
+        "num_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+    },
+}
 
 
 def parse_int_list(value: str) -> list[int]:
     return [int(item.strip()) for item in value.split(",") if item.strip()]
 
 
-def parse_float_list(value: str) -> list[float]:
-    return [float(item.strip()) for item in value.split(",") if item.strip()]
-
-
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Benchmark FA2 and block-sparse attention kernels.")
-    parser.add_argument("--model_name", default=DEFAULT_MODEL_NAME)
-    parser.add_argument("--sparsity_mask", "--sparsity-mask", default="topk", choices=SPARSITY_MASKS)
-    parser.add_argument("--q-block-size", dest="q_block_size", type=int, default=128)
-    parser.add_argument("--k-block-size", dest="k_block_size", type=int, default=128)
-    parser.add_argument("--eval_batch_size", type=int, default=1)
-    parser.add_argument("--iters", type=int, default=5)
-    parser.add_argument("--warmup", type=int, default=1)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model-key", choices=sorted(MODEL_CONFIGS), required=True)
     parser.add_argument(
-        "--context_lengths",
+        "--attention-method",
+        "--scheme",
+        dest="attention_method",
+        choices=ATTENTION_METHODS,
+        required=True,
+    )
+    parser.add_argument("--density", type=float, required=True)
+    parser.add_argument(
+        "--context-lengths",
         type=parse_int_list,
-        default=[8192, 16384, 32768, 65536, 131072],
-        help="Comma-separated context lengths.",
+        default=[32768, 65536, 131072],
     )
-    parser.add_argument(
-        "--densities",
-        type=parse_float_list,
-        default=[0.5, 0.25, 0.125, 0.0625],
-        help="Comma-separated sparse densities.",
-    )
+    parser.add_argument("--q-block-size", type=int, default=128)
+    parser.add_argument("--k-block-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--iters", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--layer-idx", type=int, default=0)
+    parser.add_argument("--predictor-checkpoint", type=Path)
+    parser.add_argument("--output-json", type=Path, required=True)
     return parser
 
 
-def _get_block_sparse_patch_module():
-    global _block_sparse_patch, _call_block_sparse_attn_func
-    if _block_sparse_patch is None:
-        _block_sparse_patch = load_DHSA_patch_module()
-        _call_block_sparse_attn_func = _block_sparse_patch._call_block_sparse_attn_func
-    return _block_sparse_patch
+def elapsed_ms(start: torch.cuda.Event, end: torch.cuda.Event) -> float:
+    return float(start.elapsed_time(end))
 
 
-def _get_sparsity_mask_fn(sparsity_mask: str):
-    patch_module = _get_block_sparse_patch_module()
-    if sparsity_mask in ["topk", "DHSA_topk"]:
-        return patch_module._generate_sparsity_mask
-    if sparsity_mask == "DHSA_a":
-        return patch_module._generate_sparsity_mask_with_A_shape
-    if sparsity_mask == "DHSA_vs":
-        return patch_module._generate_sparsity_mask_with_vertical_slash
-    if sparsity_mask == "DHSA_vsb":
-        return patch_module._generate_sparsity_mask_with_vertical_slash_blockwise
-    raise ValueError(f"sparsity_mask must be one of: {', '.join(SPARSITY_MASKS)}")
+def summarize(values: list[float], prefix: str) -> dict[str, float]:
+    return {
+        f"{prefix}_avg_ms": sum(values) / len(values),
+        f"{prefix}_median_ms": statistics.median(values),
+        f"{prefix}_min_ms": min(values),
+        f"{prefix}_max_ms": max(values),
+    }
 
 
-@torch.no_grad()
-def benchmark_kernel_DHSA(
-    config,
-    seq_len: int = 32768,
-    density: float = 0.25,
-    q_block_size: int = 128,
-    k_block_size: int = 128,
-    sparsity_mask: str = "topk",
-    iters: int = 20,
-    warmup: int = 5,
-    device: str | torch.device | None = None,
-    batch_size: int = 1,
-    use_loop: bool = False,
+def benchmark_full(
+    q: torch.Tensor,
+    k_native: torch.Tensor,
+    v_native: torch.Tensor,
+    warmup: int,
+    iters: int,
+) -> dict[str, float]:
+    q_flash = q.transpose(1, 2).contiguous()
+    k_flash = k_native.transpose(1, 2).contiguous()
+    v_flash = v_native.transpose(1, 2).contiguous()
+
+    def run_once() -> torch.Tensor:
+        return flash_attn_func(
+            q_flash,
+            k_flash,
+            v_flash,
+            causal=True,
+        )
+
+    for _ in range(warmup):
+        output = run_once()
+        if not torch.isfinite(output).all():
+            raise RuntimeError("Full FA2 output contains non-finite values")
+        del output
+
+    torch.cuda.synchronize()
+    baseline_bytes = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    attention_times = []
+    for _ in range(iters):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        output = run_once()
+        end.record()
+        torch.cuda.synchronize()
+        attention_times.append(elapsed_ms(start, end))
+        if not torch.isfinite(output).all():
+            raise RuntimeError("Full FA2 output contains non-finite values")
+        del output
+
+    peak_bytes = torch.cuda.max_memory_allocated()
+    result = {
+        **summarize(attention_times, "attention"),
+        **summarize(attention_times, "total"),
+        "mask_avg_ms": 0.0,
+        "mask_median_ms": 0.0,
+        "mask_min_ms": 0.0,
+        "mask_max_ms": 0.0,
+        "baseline_gib": baseline_bytes / 1024**3,
+        "peak_gib": peak_bytes / 1024**3,
+        "extra_gib": (peak_bytes - baseline_bytes) / 1024**3,
+    }
+    return result
+
+
+def make_mask_builder(
+    patch_module,
+    attention_method: str,
+    model_key: str,
+    predictor_checkpoint: Path | None,
+    density: float,
 ):
-    """
-    Benchmark *kernel-level* cost of DHSA, starting
-    from Q/K/V of shape (B, H, L, D), including:
+    if attention_method == "DHSA_vs_optimized":
+        return (
+            patch_module._generate_sparsity_mask_with_vertical_slash_sample32
+            if model_key == "qwen"
+            else patch_module._generate_sparsity_mask_with_vertical_slash_sample64
+        )
+    if attention_method == "DHSA_vsb_memory_efficient":
+        return patch_module._generate_sparsity_mask_with_vertical_slash_blockwise
+    if attention_method not in {
+        "DHSA_learned_topK_static",
+        "DHSA_learned_topK_dynamic",
+    }:
+        raise ValueError(
+            f"Unsupported sparse attention method: {attention_method}"
+        )
+    if predictor_checkpoint is None:
+        raise ValueError(
+            f"{attention_method} requires --predictor-checkpoint"
+        )
+    expected_variant = (
+        "static"
+        if attention_method == "DHSA_learned_topK_static"
+        else "dynamic"
+    )
+    patch_module.load_DHSA_topk_predictor(
+        predictor_checkpoint,
+        "cuda",
+        expected_variant=expected_variant,
+        density=density,
+    )
+    return patch_module._generate_sparsity_mask_with_learned_topk
 
-      - sparsity mask construction
-      - varlen layout conversion
-      - call to block_sparse_attn_func
 
-    Q/K/V themselves are assumed to be produced by the shared linear layers and
-    are not part of the differential cost (same as dense).
-    """
-    validate_sparse_config(density, q_block_size, k_block_size)
-    _get_block_sparse_patch_module()
-    generate_sparsity_mask = _get_sparsity_mask_fn(sparsity_mask)
+def benchmark_sparse(
+    *,
+    patch_module,
+    mask_builder,
+    q: torch.Tensor,
+    k_native: torch.Tensor,
+    v_native: torch.Tensor,
+    density: float,
+    q_block_size: int,
+    k_block_size: int,
+    layer_idx: int,
+    warmup: int,
+    iters: int,
+) -> dict[str, float]:
+    batch_size, num_heads, context_length, head_dim = q.shape
+    num_key_value_heads = k_native.shape[1]
+    num_key_value_groups = num_heads // num_key_value_heads
+    cu_seqlens = torch.tensor(
+        [0, context_length],
+        device=q.device,
+        dtype=torch.int32,
+    )
+    head_mask_type = torch.ones(
+        num_heads,
+        device=q.device,
+        dtype=torch.int32,
+    )
+    topk_blocks = max(1, int(density * (context_length // k_block_size)))
 
-    if device is None:
-        device = torch.device("cuda")
-    else:
-        device = torch.device(device)
+    def expand_native_kv(sample: torch.Tensor) -> torch.Tensor:
+        return (
+            sample.transpose(0, 1)[:, :, None, :]
+            .expand(
+                context_length,
+                num_key_value_heads,
+                num_key_value_groups,
+                head_dim,
+            )
+            .reshape(context_length, num_heads, head_dim)
+            .contiguous()
+        )
 
-    if use_loop:
-        loop_size = batch_size
-        B = 1
-    else:
-        loop_size = 1
-        B = batch_size
+    def prepare_sample(
+        batch_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        q_unpad = q[batch_idx].transpose(0, 1).contiguous()
+        k_unpad = expand_native_kv(k_native[batch_idx])
+        v_unpad = expand_native_kv(v_native[batch_idx])
+        key_states = k_unpad.transpose(0, 1).contiguous().unsqueeze(0)
+        return q_unpad, k_unpad, v_unpad, key_states
 
-    H = config.num_attention_heads
-    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-    dtype = torch.bfloat16  # match your compute dtype
-
-    assert seq_len % q_block_size == 0, "seq_len must be divisible by q_block_size"
-    assert seq_len % k_block_size == 0, "seq_len must be divisible by k_block_size"
-
-    def one_call():
-        """
-        One full DHSA call, starting from Q/K/V:
-
-          Q/K/V -> sparsity mask -> varlen layout -> kernel
-        """
-
-        # 1) Block mask construction
-        num_k_blocks = seq_len // k_block_size
-        topk_blocks = max(1, int(density * num_k_blocks))
-
-        block_mask = generate_sparsity_mask(
-            query_states=query_states,
+    def build_mask(batch_idx: int, key_states: torch.Tensor) -> torch.Tensor:
+        return mask_builder(
+            query_states=q[batch_idx : batch_idx + 1],
             key_states=key_states,
             topk_blocks=topk_blocks,
             q_block_size=q_block_size,
             k_block_size=k_block_size,
-        )  # (B, H, nrow, ncol)
+            key_states_native=k_native[batch_idx : batch_idx + 1],
+            num_key_value_groups=num_key_value_groups,
+            layer_idx=layer_idx,
+        )
 
-        # 2) Convert to varlen layout
-        # (B, H, L, D) -> (B, L, H, D) -> (B*L, H, D)
-        q = query_states.permute(0, 2, 1, 3).contiguous()
-        k = key_states.permute(0, 2, 1, 3).contiguous()
-        v = value_states.permute(0, 2, 1, 3).contiguous()
-
-        B_loc, Lq, H_check, D = q.shape
-        assert B_loc == B and H_check == H
-
-        q_unpad = q.reshape(B_loc * Lq, H, D)
-        k_unpad = k.reshape(B_loc * Lq, H, D)
-        v_unpad = v.reshape(B_loc * Lq, H, D)
-
-        cu_seqlens = torch.arange(
-            0, (B_loc + 1) * Lq, step=Lq, dtype=torch.int32, device=device
-        )  # (B+1,)
-
-        head_mask_type = torch.ones(H, dtype=torch.int32, device=device)
-        p_dropout = 0.0
-        is_causal = True
-
-        _ = _call_block_sparse_attn_func(
+    def run_attention(
+        q_unpad: torch.Tensor,
+        k_unpad: torch.Tensor,
+        v_unpad: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        return patch_module._call_block_sparse_attn_func(
             q_unpad,
             k_unpad,
             v_unpad,
             cu_seqlens,
             cu_seqlens,
             head_mask_type,
-            None,          # streaming_info
-            block_mask,    # (B, H, nrow, ncol)
-            Lq,            # max_seqlen_q_
-            Lq,            # max_seqlen_k_
-            p_dropout,
+            None,
+            mask,
+            context_length,
+            context_length,
+            0.0,
             deterministic=False,
             softmax_scale=None,
-            is_causal=is_causal,
+            is_causal=True,
             exact_streaming=False,
             return_attn_probs=False,
             q_block_size=q_block_size,
             k_block_size=k_block_size,
         )
 
-    # ------------------- Build random Q/K/V (shared across runs) -------------------
-    # (B, H, L, D)
-    query_states = torch.randn(B, H, seq_len, head_dim, device=device, dtype=dtype)
-    key_states   = torch.randn_like(query_states)
-    value_states = torch.randn_like(query_states)
-
-    # ------------------- Warmup (not timed) -------------------
     for _ in range(warmup):
-        one_call()
+        for batch_idx in range(batch_size):
+            q_unpad, k_unpad, v_unpad, key_states = prepare_sample(batch_idx)
+            mask = build_mask(batch_idx, key_states)
+            output = run_attention(q_unpad, k_unpad, v_unpad, mask)
+            if not torch.isfinite(output).all():
+                raise RuntimeError("Sparse attention output contains non-finite values")
+            del output, mask, q_unpad, k_unpad, v_unpad, key_states
+
+    selected_blocks = 0
+    for batch_idx in range(batch_size):
+        k_unpad = expand_native_kv(k_native[batch_idx])
+        key_states = k_unpad.transpose(0, 1).contiguous().unsqueeze(0)
+        mask = build_mask(batch_idx, key_states)
+        selected_blocks += int(mask.sum().item())
+        del mask, k_unpad, key_states
+    num_query_blocks = context_length // q_block_size
+    recent = torch.minimum(
+        torch.arange(num_query_blocks, device=q.device) * q_block_size
+        + q_block_size
+        - 1,
+        torch.full(
+            (num_query_blocks,),
+            context_length - 1,
+            device=q.device,
+        ),
+    )
+    available = recent // k_block_size + 1
+    eligible_blocks = int(available.sum().item()) * num_heads * batch_size
 
     torch.cuda.synchronize()
     baseline_bytes = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
-
-    # ------------------- Timed iterations -------------------
-    start = torch.cuda.Event(True)
-    end = torch.cuda.Event(True)
-
-    start.record()
+    mask_times = []
+    attention_times = []
+    total_times = []
     for _ in range(iters):
-        for _ in range(loop_size):
-            one_call()
-    end.record()
+        sample_events = []
+        for batch_idx in range(batch_size):
+            q_unpad, k_unpad, v_unpad, key_states = prepare_sample(batch_idx)
+            mask_start = torch.cuda.Event(enable_timing=True)
+            mask_end = torch.cuda.Event(enable_timing=True)
+            attention_end = torch.cuda.Event(enable_timing=True)
+            mask_start.record()
+            mask = build_mask(batch_idx, key_states)
+            mask_end.record()
+            output = run_attention(q_unpad, k_unpad, v_unpad, mask)
+            attention_end.record()
+            sample_events.append((mask_start, mask_end, attention_end))
+            del output, mask, q_unpad, k_unpad, v_unpad, key_states
+        torch.cuda.synchronize()
 
-    torch.cuda.synchronize()
-    total_ms = start.elapsed_time(end)
-    avg_ms = total_ms / iters  # or / (iters * loop_size) for per-call
+        mask_time = sum(
+            elapsed_ms(start, end) for start, end, _ in sample_events
+        )
+        attention_time = sum(
+            elapsed_ms(end, attention_end)
+            for _, end, attention_end in sample_events
+        )
+        mask_times.append(mask_time)
+        attention_times.append(attention_time)
+        total_times.append(mask_time + attention_time)
 
     peak_bytes = torch.cuda.max_memory_allocated()
-    extra_bytes = peak_bytes - baseline_bytes
-
-    print(
-        f"[DHSA method] seq_len={seq_len}, density={density}, "
-        f"batch_size={batch_size}\n"
-        f"sparsity_mask={sparsity_mask}, q_block_size={q_block_size}, "
-        f"k_block_size={k_block_size}, iters={iters}\n"
-        f"  avg latency: {avg_ms:.3f} ms\n"
-        f"  extra GPU mem: {extra_bytes / 1024**3:.3f} GB "
-        f"(baseline {baseline_bytes / 1024**3:.3f} GB, "
-        f"peak {peak_bytes / 1024**3:.3f} GB)"
-    )
-
-    return avg_ms, extra_bytes
-
-
-@torch.no_grad()
-def benchmark_kernel_dense_FA2(
-    config,
-    seq_len: int = 32768,
-    iters: int = 20,
-    warmup: int = 5,
-    device=None,
-    batch_size: int = 1,
-):
-    """
-    Pure FlashAttention-2 kernel benchmark.
-    Uses flash_attn_func directly, bypassing all HF modules.
-
-    Q/K/V layout: (B, L, H, D)
-    CAUSAL mode enabled.
-    """
-    from flash_attn import flash_attn_func
-
-    if device is None:
-        device = torch.device("cuda")
-    else:
-        device = torch.device(device)
-
-    B = batch_size
-    H = config.num_attention_heads
-    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-    dtype = torch.bfloat16
-
-    # ------------------- Build QKV in FA2 layout: (B, L, H, D) -------------------
-    q = torch.randn(B, seq_len, H, head_dim, device=device, dtype=dtype)
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
-
-    # ------------------- Warmup (no timing) -------------------
-    for _ in range(warmup):
-        _ = flash_attn_func(
-            q, k, v,
-            dropout_p=0.0,
-            softmax_scale=None,
-            causal=True,
-        )
-
-    torch.cuda.synchronize()
-    baseline = torch.cuda.memory_allocated()
-    torch.cuda.reset_peak_memory_stats()
-
-    # ------------------- Timed iterations -------------------
-    times = []
-    for _ in range(iters):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-
-        start.record()
-        _ = flash_attn_func(
-            q, k, v,
-            dropout_p=0.0,
-            softmax_scale=None,
-            causal=True,
-        )
-        end.record()
-
-        torch.cuda.synchronize()
-        times.append(start.elapsed_time(end))
-
-    avg_ms = sum(times) / len(times)
-    peak = torch.cuda.max_memory_allocated()
-    extra = peak - baseline
-
-    print(
-        f"[FA2 kernel] seq_len={seq_len}, iters={iters}, batch_size={batch_size}\n"
-        f"  avg latency: {avg_ms:.3f} ms\n"
-        f"  extra GPU mem: {extra/1024**3:.3f} GB "
-        f"(baseline {baseline/1024**3:.3f} GB, "
-        f"peak {peak/1024**3:.3f} GB)"
-    )
-
-    return avg_ms, extra
-
-
-
-
-def load_config(model_name: str):
-    from transformers import AutoConfig
-
-    print(f"Loading config only for {model_name}...")
-    return AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-
-
-
-def _append_failure(results, method, density, context_length, args, error):
-    results.append({
-        "method": method,
-        "density": density,
-        "context_length": context_length,
-        "batch_size": args.eval_batch_size,
-        "sparsity_mask": getattr(args, "sparsity_mask", ""),
-        "q_block_size": getattr(args, "q_block_size", ""),
-        "k_block_size": getattr(args, "k_block_size", ""),
-        "result": None,
-        "error": str(error),
-    })
-
-
-def _safe_empty_cache() -> bool:
-    try:
-        torch.cuda.empty_cache()
-        return True
-    except RuntimeError as exc:
-        print(f"[WARN] torch.cuda.empty_cache() failed after a CUDA error: {exc}")
-        return False
+    return {
+        **summarize(mask_times, "mask"),
+        **summarize(attention_times, "attention"),
+        **summarize(total_times, "total"),
+        "selected_blocks": selected_blocks,
+        "eligible_blocks": eligible_blocks,
+        "realized_causal_density": selected_blocks / eligible_blocks,
+        "baseline_gib": baseline_bytes / 1024**3,
+        "peak_gib": peak_bytes / 1024**3,
+        "extra_gib": (peak_bytes - baseline_bytes) / 1024**3,
+        "batch_execution": "sequential_per_sample",
+    }
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    if args.eval_batch_size < 1:
-        raise ValueError("--eval_batch_size must be >= 1.")
+    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+        raise RuntimeError("Expected exactly one visible CUDA GPU")
+    if args.warmup < 0 or args.iters <= 0:
+        raise ValueError("warmup must be non-negative and iters must be positive")
+    if args.batch_size <= 0:
+        raise ValueError("batch-size must be positive")
+    if args.attention_method == "full":
+        if not math.isclose(args.density, 1.0):
+            raise ValueError("Full FA2 must use density 1.0")
+    else:
+        validate_sparse_config(
+            args.density,
+            args.q_block_size,
+            args.k_block_size,
+        )
 
-    config = load_config(args.model_name)
-    sparse_use_loop = args.eval_batch_size > 1
-    if sparse_use_loop:
-        print(
-            f"Using eval_batch_size={args.eval_batch_size}: FA2 uses one batched attention call; "
-            "DHSA uses a simple per-example loop."
+    print(f"Batch size: {args.batch_size}", flush=True)
+
+    config = MODEL_CONFIGS[args.model_key]
+    patch_module = None
+    mask_builder = None
+    if args.attention_method != "full":
+        patch_module = load_DHSA_patch_module()
+        mask_builder = make_mask_builder(
+            patch_module,
+            args.attention_method,
+            args.model_key,
+            args.predictor_checkpoint,
+            args.density,
         )
 
     results = []
-
-    print("\n" + "#" * 100)
-    print("Running FA2 + DHSA kernel benchmarks")
-
-    abort_benchmarks = False
     for context_length in args.context_lengths:
-        if abort_benchmarks:
-            break
-
-        print("=" * 100)
-        print(f"[CONTEXT] context_length={context_length}")
-
-        try:
-            print(f"[RUN] FA2 | context_length={context_length}")
-            fa2_ret = benchmark_kernel_dense_FA2(
-                config,
-                seq_len=context_length,
-                iters=args.iters,
-                warmup=args.warmup,
-                batch_size=args.eval_batch_size,
-            )
-            results.append({
-                "method": "fa2",
-                "density": None,
-                "context_length": context_length,
-                "batch_size": args.eval_batch_size,
-                "result": fa2_ret,
-            })
-        except RuntimeError as e:
-            print(f"[FAIL] FA2 failed at context_length={context_length}: {e}")
-            _append_failure(results, "fa2", None, context_length, args, e)
-            if not _safe_empty_cache():
-                abort_benchmarks = True
-                break
-
-        if not _safe_empty_cache():
-            abort_benchmarks = True
-            break
-
-        method = "DHSA"
-        q_block_size = args.q_block_size
-        k_block_size = args.k_block_size
-        sparsity_mask = args.sparsity_mask
-
-        for density in args.densities:
-            if abort_benchmarks:
-                break
-            try:
-                print(
-                    f"[RUN] {method} | density={density} | "
-                    f"context_length={context_length} | sparsity_mask={sparsity_mask} | "
-                    f"q_block_size={q_block_size} | k_block_size={k_block_size} | "
-                    f"batch_size={args.eval_batch_size} | use_loop={sparse_use_loop}"
-                )
-                sparse_ret = benchmark_kernel_DHSA(
-                    config,
-                    seq_len=context_length,
-                    density=density,
-                    q_block_size=q_block_size,
-                    k_block_size=k_block_size,
-                    sparsity_mask=sparsity_mask,
-                    iters=args.iters,
-                    warmup=args.warmup,
-                    batch_size=args.eval_batch_size,
-                    use_loop=sparse_use_loop,
-                )
-                results.append({
-                    "method": method,
-                    "density": density,
-                    "context_length": context_length,
-                    "batch_size": args.eval_batch_size,
-                    "sparsity_mask": sparsity_mask,
-                    "q_block_size": q_block_size,
-                    "k_block_size": k_block_size,
-                    "result": sparse_ret,
-                })
-            except (RuntimeError, ValueError) as e:
-                print(
-                    f"[FAIL] {method} failed at density={density}, "
-                    f"context_length={context_length}, sparsity_mask={sparsity_mask}, "
-                    f"q_block_size={q_block_size}, k_block_size={k_block_size}: {e}"
-                )
-                _append_failure(results, method, density, context_length, args, e)
-                if not _safe_empty_cache():
-                    abort_benchmarks = True
-                    break
-
-            if not _safe_empty_cache():
-                abort_benchmarks = True
-                break
-
-    print("\n" + "#" * 100)
-    print("method\tdensity\tcontext_length\tbatch_size\tsparsity_mask\tq_block_size\tk_block_size\tresult\terror")
-    for item in results:
-        print(
-            f"{item.get('method', '')}\t"
-            f"{item.get('density', '')}\t"
-            f"{item.get('context_length', '')}\t"
-            f"{item.get('batch_size', '')}\t"
-            f"{item.get('sparsity_mask', '')}\t"
-            f"{item.get('q_block_size', '')}\t"
-            f"{item.get('k_block_size', '')}\t"
-            f"{item.get('result', '')}\t"
-            f"{item.get('error', '')}"
+        if context_length % math.lcm(args.q_block_size, args.k_block_size):
+            raise ValueError(f"Context {context_length} is not block aligned")
+        generator = torch.Generator(device="cuda")
+        generator.manual_seed(args.seed + context_length)
+        shape_q = (
+            args.batch_size,
+            config["num_heads"],
+            context_length,
+            config["head_dim"],
         )
+        shape_kv = (
+            args.batch_size,
+            config["num_key_value_heads"],
+            context_length,
+            config["head_dim"],
+        )
+        q = torch.randn(
+            shape_q,
+            generator=generator,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        k_native = torch.randn(
+            shape_kv,
+            generator=generator,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        v_native = torch.randn(
+            shape_kv,
+            generator=generator,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+
+        if args.attention_method == "full":
+            metrics = benchmark_full(
+                q,
+                k_native,
+                v_native,
+                args.warmup,
+                args.iters,
+            )
+        else:
+            metrics = benchmark_sparse(
+                patch_module=patch_module,
+                mask_builder=mask_builder,
+                q=q,
+                k_native=k_native,
+                v_native=v_native,
+                density=args.density,
+                q_block_size=args.q_block_size,
+                k_block_size=args.k_block_size,
+                layer_idx=args.layer_idx,
+                warmup=args.warmup,
+                iters=args.iters,
+            )
+        metrics["context_length"] = context_length
+        results.append(metrics)
+        print(
+            f"{args.model_key} {args.attention_method} density={args.density:g} "
+            f"context={context_length} "
+            f"mask={metrics['mask_median_ms']:.3f}ms "
+            f"attention={metrics['attention_median_ms']:.3f}ms "
+            f"total={metrics['total_median_ms']:.3f}ms "
+            f"peak={metrics['peak_gib']:.3f}GiB",
+            flush=True,
+        )
+        del q, k_native, v_native
+        torch.cuda.empty_cache()
+
+    report = {
+        **config,
+        "device": torch.cuda.get_device_name(0),
+        "torch_version": torch.__version__,
+        "attention_method": args.attention_method,
+        "density": args.density,
+        "q_block_size": args.q_block_size,
+        "k_block_size": args.k_block_size,
+        "batch_size": args.batch_size,
+        "warmup": args.warmup,
+        "iters": args.iters,
+        "layer_idx": args.layer_idx,
+        "predictor_checkpoint": (
+            str(args.predictor_checkpoint)
+            if args.predictor_checkpoint is not None
+            else None
+        ),
+        "scope": "single_attention_layer_mask_plus_kernel",
+        "results": results,
+    }
+    args.output_json.parent.mkdir(parents=True, exist_ok=True)
+    args.output_json.write_text(
+        json.dumps(report, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 if __name__ == "__main__":

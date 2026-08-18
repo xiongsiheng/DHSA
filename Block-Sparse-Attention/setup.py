@@ -51,7 +51,7 @@ LLAMA8B_BF16_CAUSAL_ONLY = os.getenv("BLOCK_SPARSE_ATTN_LLAMA8B_BF16_CAUSAL_ONLY
 FORCE_CXX11_ABI = os.getenv("BLOCK_SPARSE_ATTN_FORCE_CXX11_ABI", "FALSE") == "TRUE"
 @functools.lru_cache(maxsize=None)
 def cuda_archs() -> str:
-    return os.getenv("BLOCK_SPARSE_ATTN_CUDA_ARCHS", "80;90;100;110;120").split(";")
+    return os.getenv("BLOCK_SPARSE_ATTN_CUDA_ARCHS", "80;86;89").split(";")
 
 
 def get_platform():
@@ -80,12 +80,8 @@ def get_cuda_bare_metal_version(cuda_dir):
 
 def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
     """
-    Adds -gencode flags based on nvcc capabilities:
-      - sm_80/90 (regular)
-      - sm_100/120 on CUDA >= 12.8
-      - Use 100f on CUDA >= 12.9 (Blackwell family-specific)
-      - Map requested 110 -> 101 if CUDA < 13.0 (Thor rename)
-      - Embed PTX for newest arch for forward compatibility
+    Add cubins for A100, RTX 3090, and RTX 4090 plus PTX for the newest
+    architecture accepted by the active toolkit.
     """
     emitted_archs = []
 
@@ -196,9 +192,7 @@ def append_nvcc_threads(nvcc_extra_args):
 cmdclass = {}
 ext_modules = []
 
-# We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
-# files included in the source distribution, in case the user compiles from source.
-subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
+# CUTLASS headers are vendored in csrc/cutlass/include for reproducible builds.
 
 if not SKIP_CUDA_BUILD:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
@@ -292,9 +286,6 @@ if not SKIP_CUDA_BUILD:
     if LLAMA8B_BF16_CAUSAL_ONLY:
         fwd_sources = [
             "csrc/block_sparse_attn/flash_api.cpp",
-            "csrc/block_sparse_attn/src/flash_fwd_block_hdim128_fp16_sm80.cu",
-            "csrc/block_sparse_attn/src/flash_fwd_block_hdim128_fp16_causal_sm80.cu",
-            "csrc/block_sparse_attn/src/flash_fwd_block_hdim128_bf16_sm80.cu",
             "csrc/block_sparse_attn/src/flash_fwd_block_hdim128_bf16_causal_sm80.cu",
         ]
 

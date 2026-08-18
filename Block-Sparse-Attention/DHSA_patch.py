@@ -48,9 +48,110 @@ _BLOCK_SPARSE_ATTN_SUPPORTS_BLOCK_DIMS = {
     "n_block_dim",
 }.issubset(_BLOCK_SPARSE_ATTN_PARAMS)
 _WARNED_COARSENED_K_BLOCK_SIZE = False
+_DHSA_PROFILE_ENABLED = False
+_DHSA_PROFILE_EVENTS = []
+_DHSA_QK_COLLECTOR = None
+_DHSA_TOPK_PREDICTOR = None
+_DHSA_TOPK_PREDICTOR_VARIANT = None
+
+
+def set_DHSA_profile_enabled(enabled: bool) -> None:
+    """Enable or disable CUDA-event profiling for mask and attention work."""
+    global _DHSA_PROFILE_ENABLED
+    _DHSA_PROFILE_ENABLED = bool(enabled)
+
+
+def reset_DHSA_profile() -> None:
+    """Discard all CUDA profiling events collected by patched attention."""
+    _DHSA_PROFILE_EVENTS.clear()
+
+
+def set_DHSA_qk_collector(collector) -> None:
+    """Register an optional callback that receives per-layer Q/K/V tensors."""
+    global _DHSA_QK_COLLECTOR
+    _DHSA_QK_COLLECTOR = collector
+
+
+def load_DHSA_topk_predictor(
+    checkpoint_path,
+    device,
+    expected_variant: Optional[str] = None,
+    density: Optional[float] = None,
+) -> str:
+    """Load and validate a learned TopK predictor for one sparse density."""
+    global _DHSA_TOPK_PREDICTOR, _DHSA_TOPK_PREDICTOR_VARIANT
+    from topk_predictor import (
+        ConditionalTopKMLP,
+        resolve_density_config,
+        validate_latest_checkpoint,
+    )
+
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+    validate_latest_checkpoint(checkpoint)
+    predictor_config = resolve_density_config(
+        checkpoint["predictor_config"],
+        checkpoint.get("density_config_overrides"),
+        density,
+    )
+    predictor = ConditionalTopKMLP(**predictor_config)
+    predictor_variant = (
+        "dynamic" if predictor.sample_budget_buckets > 0 else "static"
+    )
+    if (
+        expected_variant is not None
+        and predictor_variant != expected_variant
+    ):
+        raise ValueError(
+            f"Expected a {expected_variant} learned TopK checkpoint, "
+            f"but {checkpoint_path} is {predictor_variant}."
+        )
+    predictor.load_state_dict(checkpoint["state_dict"])
+    predictor.set_sample_prototypes(checkpoint["sample_prototypes"])
+    predictor.to(device=device, dtype=torch.bfloat16)
+    predictor.eval()
+    for parameter in predictor.parameters():
+        parameter.requires_grad_(False)
+    _DHSA_TOPK_PREDICTOR = predictor
+    _DHSA_TOPK_PREDICTOR_VARIANT = predictor_variant
+    return predictor_variant
+
+
+def summarize_DHSA_profile() -> dict:
+    """Synchronize recorded CUDA events and return aggregate timing metrics."""
+    if not _DHSA_PROFILE_EVENTS:
+        return {
+            "calls": 0,
+            "mask_ms": 0.0,
+            "attention_ms": 0.0,
+            "mask_ms_per_call": 0.0,
+            "attention_ms_per_call": 0.0,
+        }
+
+    torch.cuda.synchronize()
+    mask_ms = sum(
+        start.elapsed_time(end)
+        for start, end, _, _ in _DHSA_PROFILE_EVENTS
+    )
+    attention_ms = sum(
+        start.elapsed_time(end)
+        for _, _, start, end in _DHSA_PROFILE_EVENTS
+    )
+    calls = len(_DHSA_PROFILE_EVENTS)
+    return {
+        "calls": calls,
+        "mask_ms": mask_ms,
+        "attention_ms": attention_ms,
+        "mask_ms_per_call": mask_ms / calls,
+        "attention_ms_per_call": attention_ms / calls,
+    }
 
 
 def _patch_flash_attn_unpad_input_compat() -> None:
+    """Adapt newer five-value FlashAttention unpadding results to four values."""
     try:
         import transformers.modeling_flash_attention_utils as flash_utils
     except Exception:
@@ -61,6 +162,7 @@ def _patch_flash_attn_unpad_input_compat() -> None:
         return
 
     def _compat_unpad_input(*args, **kwargs):
+        """Drop the extra FlashAttention return value when it is present."""
         result = unpad_input(*args, **kwargs)
         if isinstance(result, tuple) and len(result) == 5:
             return result[:4]
@@ -74,6 +176,7 @@ _patch_flash_attn_unpad_input_compat()
 
 
 def _is_stale_k_block_size_error(exc: RuntimeError) -> bool:
+    """Return whether a kernel error indicates obsolete key-block support."""
     message = str(exc)
     return (
         "n_block_dim must be a multiple of 128" in message
@@ -82,6 +185,7 @@ def _is_stale_k_block_size_error(exc: RuntimeError) -> bool:
 
 
 def _allow_coarsened_k_block_fallback() -> bool:
+    """Read the opt-in switch for emulating small key blocks with size 128."""
     return os.getenv("BLOCK_SPARSE_ALLOW_COARSENED_K_BLOCK_FALLBACK", "").lower() in {
         "1",
         "true",
@@ -94,6 +198,7 @@ def _coarsen_key_block_mask(
     k_block_size: int,
     effective_k_block_size: int,
 ) -> Optional[torch.Tensor]:
+    """Merge adjacent key-mask columns for a coarser CUDA key-block size."""
     if block_mask is None or k_block_size == effective_k_block_size:
         return block_mask
     if effective_k_block_size % k_block_size != 0:
@@ -109,6 +214,7 @@ def _coarsen_key_block_mask(
 
 
 def _warn_coarsened_k_block_size(k_block_size: int, effective_k_block_size: int) -> None:
+    """Emit the coarsened-key-block fallback warning at most once."""
     global _WARNED_COARSENED_K_BLOCK_SIZE
     if _WARNED_COARSENED_K_BLOCK_SIZE:
         return
@@ -122,7 +228,9 @@ def _warn_coarsened_k_block_size(k_block_size: int, effective_k_block_size: int)
 
 
 def _resolve_block_sparse_attn_backend():
+    """Locate the low-level autograd backend needed for custom block sizes."""
     def _safe_getattr(obj, name, default=None):
+        """Read an attribute without allowing module proxy errors to escape."""
         try:
             return getattr(obj, name, default)
         except Exception:
@@ -184,6 +292,7 @@ def _call_block_sparse_attn_func(
     q_block_size: int,
     k_block_size: int,
 ):
+    """Invoke block-sparse attention across supported extension interfaces."""
     kwargs = {
         "deterministic": deterministic,
         "softmax_scale": softmax_scale,
@@ -319,6 +428,7 @@ def _call_block_sparse_attn_func(
 
 
 def _get_cache_seq_length(past_key_value, layer_idx: int) -> int:
+    """Read the cached token count across Transformers cache API versions."""
     if past_key_value is None:
         return 0
     if hasattr(past_key_value, "get_seq_length"):
@@ -335,6 +445,7 @@ def _get_cache_seq_length(past_key_value, layer_idx: int) -> int:
 
 
 def _slice_cache_position_embeddings(tensor: torch.Tensor, seq_len: int) -> torch.Tensor:
+    """Trim padded rotary embeddings before storing original tokens in cache."""
     if tensor is None:
         return tensor
     if tensor.shape[-2] >= seq_len:
@@ -343,10 +454,12 @@ def _slice_cache_position_embeddings(tensor: torch.Tensor, seq_len: int) -> torc
 
 
 def _round_to_multiple(x: int, base: int) -> int:
+    """Round a positive sequence length up to the requested alignment."""
     return ((x + base - 1) // base) * base
 
 
 def _mask_prediction_chunk_elements() -> int:
+    """Return the configured temporary-element budget for mask prediction."""
     try:
         return max(1, int(os.getenv("DHSA_MASK_PREDICTION_CHUNK_ELEMENTS", "8388608")))
     except ValueError:
@@ -360,6 +473,7 @@ def _mask_prediction_row_chunk_size(
     num_k_blocks: int,
     selected_count: int = 0,
 ) -> int:
+    """Choose a query-row chunk size that respects the temporary-memory budget."""
     elements_per_row = max(1, batch_size * num_heads * max(num_k_blocks, selected_count, 1))
     return max(1, min(num_rows, _mask_prediction_chunk_elements() // elements_per_row))
 
@@ -370,6 +484,7 @@ def _recent_key_blocks_for_rows(
     q_block_size: int,
     k_block_size: int,
 ) -> torch.Tensor:
+    """Map each query row to its most recent causal key block."""
     return torch.clamp(
         ((row_indices + 1) * q_block_size - 1) // k_block_size,
         max=num_k_blocks - 1,
@@ -382,6 +497,7 @@ def _q_start_key_blocks_for_rows(
     q_block_size: int,
     k_block_size: int,
 ) -> torch.Tensor:
+    """Map each query row start position to a key-block index."""
     return torch.clamp(
         (row_indices * q_block_size) // k_block_size,
         max=num_k_blocks - 1,
@@ -393,7 +509,35 @@ def _or_scattered_topk_by_row_budget(
     row_scores: torch.Tensor,
     remaining_by_row: torch.Tensor,
 ) -> None:
+    """OR each row's highest-scoring eligible blocks into an existing mask."""
     if remaining_by_row.numel() == 0:
+        return
+
+    if remaining_by_row.ndim != 1:
+        try:
+            expanded_remaining = torch.broadcast_to(
+                remaining_by_row,
+                row_scores.shape[:-1],
+            )
+        except RuntimeError as exc:
+            raise ValueError(
+                "remaining_by_row cannot broadcast to score rows"
+            ) from exc
+        max_remaining = int(expanded_remaining.max().item())
+        if max_remaining <= 0:
+            return
+        max_remaining = min(max_remaining, row_scores.shape[-1])
+        top_indices = row_scores.topk(k=max_remaining, dim=-1).indices
+        keep_by_rank = (
+            torch.arange(
+                max_remaining,
+                device=row_scores.device,
+            ).view(1, 1, 1, max_remaining)
+            < expanded_remaining.unsqueeze(-1)
+        )
+        topk_mask = torch.zeros_like(row_scores, dtype=torch.bool)
+        topk_mask.scatter_(-1, top_indices, keep_by_rank)
+        mask_chunk.logical_or_(topk_mask)
         return
 
     active_rows = remaining_by_row > 0
@@ -427,6 +571,7 @@ def _generate_sparsity_mask(
     block_size: Optional[int] = None,
     q_block_size: Optional[int] = None,
     k_block_size: Optional[int] = None,
+    **_,
 ):
     """
     Obtain the top-k blocks mask for each query block.
@@ -493,6 +638,11 @@ def _generate_sparsity_mask_with_A_shape(
     block_size: Optional[int] = None,
     q_block_size: Optional[int] = None,
     k_block_size: Optional[int] = None,
+    force_local_band: bool = False,
+    score_predictor=None,
+    layer_idx: Optional[int] = None,
+    score_compute_dtype: torch.dtype = torch.float32,
+    **_,
 ):
     """
     Obtain a block mask with an A-shaped pattern.
@@ -535,14 +685,6 @@ def _generate_sparsity_mask_with_A_shape(
     q_blocks = query_states.view(b, h, num_q_blocks, q_block_size, d)
     k_blocks = key_states.view(b, h, num_k_blocks, k_block_size, d)
 
-    q_block_repr = q_blocks.float().mean(dim=3)  # (B, H, n_q_blocks, D)
-    k_block_repr = k_blocks.float().mean(dim=3)  # (B, H, n_k_blocks, D)
-
-    scores = torch.matmul(
-        q_block_repr,                       # (B, H, n_q_blocks, D)
-        k_block_repr.transpose(-2, -1),     # (B, H, D, n_k_blocks)
-    )
-
     target_k = min(max(0, int(topk_blocks)), num_k_blocks)
     row_indices = torch.arange(num_q_blocks, device=query_states.device)
     key_block_positions = torch.arange(num_k_blocks, device=query_states.device)
@@ -552,8 +694,67 @@ def _generate_sparsity_mask_with_A_shape(
         q_block_size,
         k_block_size,
     )
+    q_start_key_blocks = _q_start_key_blocks_for_rows(
+        row_indices,
+        num_k_blocks,
+        q_block_size,
+        k_block_size,
+    )
     available_counts = recent_key_blocks + 1
     dense_rows = available_counts <= target_k
+
+    if score_predictor is None:
+        budget_logits = None
+        q_block_repr = q_blocks.to(score_compute_dtype).mean(dim=3)
+        k_block_repr = k_blocks.to(score_compute_dtype).mean(dim=3)
+        scores = torch.matmul(
+            q_block_repr,
+            k_block_repr.transpose(-2, -1),
+        )
+    else:
+        query_segments = int(getattr(score_predictor, "query_segments", 1))
+        key_segments = int(getattr(score_predictor, "key_segments", 1))
+        if q_block_size % query_segments or k_block_size % key_segments:
+            raise ValueError("Predictor segments must divide the block sizes")
+        q_block_repr = (
+            q_blocks.view(
+                b,
+                h,
+                num_q_blocks,
+                query_segments,
+                q_block_size // query_segments,
+                d,
+            )
+            .mean(dim=-2)
+        )
+        k_block_repr = (
+            k_blocks.view(
+                b,
+                h,
+                num_k_blocks,
+                key_segments,
+                k_block_size // key_segments,
+                d,
+            )
+            .mean(dim=-2)
+        )
+        if int(getattr(score_predictor, "sample_budget_buckets", 0)) > 0:
+            scores, auxiliary = score_predictor(
+                q_block_repr,
+                k_block_repr,
+                layer_idx=layer_idx,
+                valid_counts=available_counts,
+                return_aux=True,
+            )
+            budget_logits = auxiliary["budget_logits"]
+        else:
+            scores = score_predictor(
+                q_block_repr,
+                k_block_repr,
+                layer_idx=layer_idx,
+                valid_counts=available_counts,
+            )
+            budget_logits = None
 
     causal_mask = key_block_positions.view(1, -1) <= recent_key_blocks.view(-1, 1)
     mask = (
@@ -562,28 +763,81 @@ def _generate_sparsity_mask_with_A_shape(
     ).expand(b, h, -1, -1).clone()
 
     sparse_rows = ~dense_rows
+    if force_local_band:
+        reserve_sink = (q_start_key_blocks > 0) & (target_k > 1)
+        local_budget = target_k - reserve_sink.long()
+        structured_local_start = torch.maximum(
+            q_start_key_blocks,
+            recent_key_blocks - local_budget + 1,
+        )
+        local_mask = (
+            (key_block_positions.view(1, num_k_blocks) >= structured_local_start.view(num_q_blocks, 1))
+            & (key_block_positions.view(1, num_k_blocks) <= recent_key_blocks.view(num_q_blocks, 1))
+        )
+        sink_mask = reserve_sink.view(num_q_blocks, 1) & (
+            key_block_positions.view(1, num_k_blocks) == 0
+        )
+    else:
+        local_mask = (
+            key_block_positions.view(1, num_k_blocks)
+            == recent_key_blocks.view(num_q_blocks, 1)
+        )
+        sink_mask = key_block_positions.view(1, num_k_blocks) == 0
     forced_mask = sparse_rows.view(num_q_blocks, 1) & (
-        (key_block_positions.view(1, num_k_blocks) == 0)
-        | (key_block_positions.view(1, num_k_blocks) == recent_key_blocks.view(num_q_blocks, 1))
+        sink_mask | local_mask
     )
     mask.logical_or_(forced_mask.view(1, 1, num_q_blocks, num_k_blocks))
 
     middle_counts = torch.clamp(recent_key_blocks - 1, min=0)
-    forced_counts = 1 + (recent_key_blocks != 0).long()
-    remaining_by_row = torch.minimum(
-        torch.clamp(target_k - forced_counts, min=0),
-        middle_counts,
-    )
-    remaining_by_row = torch.where(
-        sparse_rows,
-        remaining_by_row,
-        torch.zeros_like(remaining_by_row),
-    )
+    if force_local_band:
+        local_band_counts = recent_key_blocks - structured_local_start + 1
+        forced_counts = local_band_counts + reserve_sink.long()
+    else:
+        forced_counts = 1 + (recent_key_blocks != 0).long()
+    if budget_logits is None:
+        remaining_by_row = torch.minimum(
+            torch.clamp(target_k - forced_counts, min=0),
+            middle_counts,
+        )
+        remaining_by_row = torch.where(
+            sparse_rows,
+            remaining_by_row,
+            torch.zeros_like(remaining_by_row),
+        )
+    else:
+        from topk_predictor import allocate_dynamic_row_budgets
+
+        dynamic_budgets = allocate_dynamic_row_budgets(
+            budget_logits,
+            available_counts,
+            target_k,
+            minimum_counts=forced_counts,
+            min_ratio=float(
+                score_predictor.dynamic_density_min_ratio
+            ),
+            max_ratio=float(
+                score_predictor.dynamic_density_max_ratio
+            ),
+        )
+        remaining_by_row = torch.clamp(
+            dynamic_budgets - forced_counts.view(1, 1, -1),
+            min=0,
+        )
+        remaining_by_row = torch.where(
+            sparse_rows.view(1, 1, -1),
+            remaining_by_row,
+            torch.zeros_like(remaining_by_row),
+        )
 
     eligible_middle = (
         (key_block_positions.view(1, num_k_blocks) > 0)
         & (key_block_positions.view(1, num_k_blocks) < recent_key_blocks.view(num_q_blocks, 1))
     )
+    if force_local_band:
+        eligible_middle &= (
+            key_block_positions.view(1, num_k_blocks)
+            < structured_local_start.view(num_q_blocks, 1)
+        )
     row_scores = scores.masked_fill(
         ~eligible_middle.view(1, 1, num_q_blocks, num_k_blocks),
         float("-inf"),
@@ -591,6 +845,32 @@ def _generate_sparsity_mask_with_A_shape(
     _or_scattered_topk_by_row_budget(mask, row_scores, remaining_by_row)
 
     return mask
+
+
+def _generate_sparsity_mask_with_structured_topk(*args, **kwargs):
+    """Build an A-shaped mask using full-precision structured TopK scores."""
+    kwargs["force_local_band"] = True
+    return _generate_sparsity_mask_with_A_shape(*args, **kwargs)
+
+
+def _generate_sparsity_mask_with_structured_topk_fast(*args, **kwargs):
+    """Build the structured TopK mask with BF16 score computation."""
+    kwargs.update(
+        force_local_band=True,
+        score_compute_dtype=torch.bfloat16,
+    )
+    return _generate_sparsity_mask_with_A_shape(*args, **kwargs)
+
+
+def _generate_sparsity_mask_with_learned_topk(*args, **kwargs):
+    """Build an A-shaped mask with the globally loaded learned predictor."""
+    if _DHSA_TOPK_PREDICTOR is None:
+        raise RuntimeError("The learned TopK predictor has not been loaded")
+    kwargs.update(
+        force_local_band=True,
+        score_predictor=_DHSA_TOPK_PREDICTOR,
+    )
+    return _generate_sparsity_mask_with_A_shape(*args, **kwargs)
 
 
 def _generate_sparsity_mask_with_vertical_slash(
@@ -601,6 +881,14 @@ def _generate_sparsity_mask_with_vertical_slash(
     q_block_size: Optional[int] = None,
     k_block_size: Optional[int] = None,
     vertical_slash_ratio: float = 0.5,
+    key_states_native: Optional[torch.Tensor] = None,
+    num_key_value_groups: int = 1,
+    use_native_gqa: bool = False,
+    predictor_compute_dtype: torch.dtype = torch.float32,
+    predictor_softmax_dtype: Optional[torch.dtype] = None,
+    predictor_last_q: Optional[int] = None,
+    predictor_query_samples: Optional[int] = None,
+    **_,
 ):
     """
     Obtain an A-shaped block mask whose middle rows are predicted from vertical
@@ -662,25 +950,67 @@ def _generate_sparsity_mask_with_vertical_slash(
         max(0, math.ceil(token_budget / q_block_size)) if token_budget > 0 else 0,
     )
 
-    q_last = min(q_block_size, seq_q, seq_k)
-    last_query_states = query_states[..., -q_last:, :].float()
-    key_states_fp32 = key_states.float()
-    scores = torch.matmul(
-        last_query_states,
-        key_states_fp32.transpose(-2, -1),
-    ) * (1.0 / math.sqrt(d))
+    if predictor_query_samples is None:
+        q_window = min(predictor_last_q or q_block_size, seq_q, seq_k)
+        last_query_positions = torch.arange(
+            seq_q - q_window,
+            seq_q,
+            device=query_states.device,
+        )
+    else:
+        q_window = min(q_block_size, seq_q, seq_k)
+        query_samples = min(max(1, int(predictor_query_samples)), q_window)
+        query_offsets = torch.linspace(
+            0,
+            q_window - 1,
+            steps=query_samples,
+            device=query_states.device,
+        ).round().long().unique()
+        last_query_positions = seq_q - q_window + query_offsets
+    q_last = last_query_positions.numel()
+    last_query_states = query_states.index_select(
+        -2,
+        last_query_positions,
+    ).to(predictor_compute_dtype)
+    if use_native_gqa:
+        if key_states_native is None:
+            raise ValueError("key_states_native is required for the GQA VS predictor")
+        num_kv_heads = key_states_native.shape[1]
+        if h != num_kv_heads * num_key_value_groups:
+            raise ValueError(
+                "query heads must equal native KV heads times num_key_value_groups"
+            )
+        grouped_queries = last_query_states.view(
+            b,
+            num_kv_heads,
+            num_key_value_groups,
+            q_last,
+            d,
+        )
+        native_keys = key_states_native.to(predictor_compute_dtype)
+        scores = torch.einsum(
+            "bhgqd,bhkd->bhgqk",
+            grouped_queries,
+            native_keys,
+        ).reshape(b, h, q_last, seq_k)
+    else:
+        predictor_keys = key_states.to(predictor_compute_dtype)
+        scores = torch.matmul(
+            last_query_states,
+            predictor_keys.transpose(-2, -1),
+        )
+    scores = scores * (1.0 / math.sqrt(d))
 
     key_positions = torch.arange(seq_k, device=query_states.device)
-    last_query_positions = torch.arange(
-        seq_k - q_last,
-        seq_k,
-        device=query_states.device,
-    )
     scores = scores.masked_fill(
         key_positions.view(1, 1, 1, seq_k) > last_query_positions.view(1, 1, q_last, 1),
         float("-inf"),
     )
-    last_query_attn = torch.softmax(scores, dim=-1)  # (B, H, q_last, seq_k)
+    last_query_attn = torch.softmax(
+        scores,
+        dim=-1,
+        dtype=predictor_softmax_dtype,
+    )  # (B, H, q_last, seq_k)
 
     col_scores = last_query_attn.sum(dim=-2)  # (B, H, seq_k)
     vertical_block_scores = torch.zeros(
@@ -826,6 +1156,59 @@ def _generate_sparsity_mask_with_vertical_slash(
     return mask
 
 
+def _generate_sparsity_mask_with_vertical_slash_gqa(*args, **kwargs):
+    """Run the vertical-slash predictor on native GQA heads in FP32."""
+    kwargs.update(
+        use_native_gqa=True,
+        predictor_compute_dtype=torch.float32,
+        predictor_softmax_dtype=None,
+    )
+    return _generate_sparsity_mask_with_vertical_slash(*args, **kwargs)
+
+
+def _generate_sparsity_mask_with_vertical_slash_fast(*args, **kwargs):
+    """Run native-GQA vertical-slash prediction in BF16 with FP32 softmax."""
+    kwargs.update(
+        use_native_gqa=True,
+        predictor_compute_dtype=torch.bfloat16,
+        predictor_softmax_dtype=torch.float32,
+    )
+    return _generate_sparsity_mask_with_vertical_slash(*args, **kwargs)
+
+
+def _generate_sparsity_mask_with_vertical_slash_fast64(*args, **kwargs):
+    """Run fast vertical-slash prediction using the final 64 query tokens."""
+    kwargs.update(
+        use_native_gqa=True,
+        predictor_compute_dtype=torch.bfloat16,
+        predictor_softmax_dtype=torch.float32,
+        predictor_last_q=64,
+    )
+    return _generate_sparsity_mask_with_vertical_slash(*args, **kwargs)
+
+
+def _generate_sparsity_mask_with_vertical_slash_sample64(*args, **kwargs):
+    """Run fast vertical-slash prediction with 64 sampled query positions."""
+    kwargs.update(
+        use_native_gqa=True,
+        predictor_compute_dtype=torch.bfloat16,
+        predictor_softmax_dtype=torch.float32,
+        predictor_query_samples=64,
+    )
+    return _generate_sparsity_mask_with_vertical_slash(*args, **kwargs)
+
+
+def _generate_sparsity_mask_with_vertical_slash_sample32(*args, **kwargs):
+    """Run fast vertical-slash prediction with 32 sampled query positions."""
+    kwargs.update(
+        use_native_gqa=True,
+        predictor_compute_dtype=torch.bfloat16,
+        predictor_softmax_dtype=torch.float32,
+        predictor_query_samples=32,
+    )
+    return _generate_sparsity_mask_with_vertical_slash(*args, **kwargs)
+
+
 def _generate_sparsity_mask_with_vertical_slash_blockwise(
     query_states: torch.Tensor,
     key_states: torch.Tensor,
@@ -834,6 +1217,7 @@ def _generate_sparsity_mask_with_vertical_slash_blockwise(
     q_block_size: Optional[int] = None,
     k_block_size: Optional[int] = None,
     vertical_slash_ratio: float = 0.5,
+    **_,
 ):
     """
     Memory-efficient A-shaped vertical/slash block mask.
@@ -1084,6 +1468,7 @@ def _generate_sparsity_mask_with_vertical_slash_blockwise(
 
 
 def _validate_sparse_block_sizes(q_block_size: int, k_block_size: int) -> None:
+    """Validate query and key block sizes accepted by the CUDA kernel."""
     if q_block_size <= 0 or k_block_size <= 0:
         raise ValueError("q_block_size and k_block_size must be positive")
     if q_block_size % 128 != 0:
@@ -1093,6 +1478,7 @@ def _validate_sparse_block_sizes(q_block_size: int, k_block_size: int) -> None:
 
 
 def _chunked_sequence_module(module: nn.Module, x: torch.Tensor, chunk_size: int) -> torch.Tensor:
+    """Apply a token-wise module in sequence chunks to reduce peak memory."""
     bsz, seq_len, hidden_size = x.shape
     if seq_len <= chunk_size:
         return module(x)
@@ -1110,6 +1496,7 @@ def _chunked_sequence_module(module: nn.Module, x: torch.Tensor, chunk_size: int
 
 
 def _chunked_llama_mlp(mlp: nn.Module, x: torch.Tensor, chunk_size: int) -> torch.Tensor:
+    """Evaluate a gated LLaMA MLP in sequence chunks with one output buffer."""
     bsz, seq_len, hidden_size = x.shape
     if seq_len <= chunk_size:
         return mlp(x)
@@ -1143,6 +1530,7 @@ def _llama_decoder_layer_chunked_forward(
     position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     **kwargs,
 ):
+    """Run a LLaMA decoder layer with chunked norms, MLP, and patched attention."""
     residual = hidden_states
 
     norm_chunk_size = int(getattr(self, "_block_sparse_norm_chunk_size", 2048))
@@ -1187,6 +1575,7 @@ def _llama_decoder_layer_chunked_forward(
 
 
 def _filter_kwargs_for_callable(fn, kwargs: dict) -> dict:
+    """Filter compatibility keyword arguments for a target forward signature."""
     signature = inspect.signature(fn)
     has_var_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values())
     filtered = {key: value for key, value in kwargs.items() if key in signature.parameters}
@@ -1213,10 +1602,12 @@ def _filter_kwargs_for_callable(fn, kwargs: dict) -> dict:
 
 
 def _call_original_forward(self: nn.Module, hidden_states: torch.Tensor, **kwargs):
+    """Call the saved attention forward with only supported keyword arguments."""
     return self._original_forward(hidden_states, **_filter_kwargs_for_callable(self._original_forward, kwargs))
 
 
 def _patchable_attention_classes():
+    """Return installed LLaMA and Qwen2 FlashAttention classes that can be patched."""
     classes = [LlamaFlashAttention2]
     for cls in (Qwen2FlashAttention2,):
         if cls is not None:
@@ -1225,6 +1616,7 @@ def _patchable_attention_classes():
 
 
 def _attention_family(module: nn.Module) -> str:
+    """Infer whether an attention module follows the Qwen2 or LLaMA API."""
     cls_name = module.__class__.__name__.lower()
     model_type = str(getattr(getattr(module, "config", None), "model_type", "")).lower()
     if "qwen2" in cls_name or "qwen2" in model_type:
@@ -1233,12 +1625,14 @@ def _attention_family(module: nn.Module) -> str:
 
 
 def _family_apply_rotary(family: str):
+    """Select the model family's rotary-position application function."""
     if family == "qwen2" and qwen2_apply_rotary_pos_emb is not None:
         return qwen2_apply_rotary_pos_emb
     return llama_apply_rotary_pos_emb
 
 
 def _family_repeat_kv(family: str):
+    """Select the model family's grouped-query KV expansion function."""
     if family == "qwen2" and qwen2_repeat_kv is not None:
         return qwen2_repeat_kv
     return llama_repeat_kv
@@ -1251,6 +1645,7 @@ def _compute_rotary_embeddings(
     position_ids: Optional[torch.LongTensor],
     position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
 ):
+    """Use supplied rotary embeddings or compute them through the module."""
     if position_embeddings is not None:
         return position_embeddings
     rotary_emb = getattr(self, "rotary_emb", None)
@@ -1262,6 +1657,7 @@ def _compute_rotary_embeddings(
 
 
 def _maybe_apply_qk_norm(self: nn.Module, query_states: torch.Tensor, key_states: torch.Tensor):
+    """Apply optional model-specific query and key normalization modules."""
     q_norm = getattr(self, "q_norm", None)
     k_norm = getattr(self, "k_norm", None)
     if q_norm is not None:
@@ -1272,6 +1668,7 @@ def _maybe_apply_qk_norm(self: nn.Module, query_states: torch.Tensor, key_states
 
 
 def _cache_aliases(past_key_value=None, past_key_values=None):
+    """Normalize singular and plural Transformers cache argument names."""
     return past_key_values if past_key_values is not None else past_key_value
 
 
@@ -1282,6 +1679,7 @@ def _update_past_key_value(
     layer_idx: int,
     cache_kwargs: dict,
 ):
+    """Update a Transformers cache across old and new update signatures."""
     try:
         return past_key_value.update(key_states, value_states, layer_idx, cache_kwargs)
     except TypeError:
@@ -1419,6 +1817,23 @@ def _block_sparse_forward(
     query_states, key_states = _maybe_apply_qk_norm(self, query_states, key_states)
     cos, sin = _compute_rotary_embeddings(self, family, value_states, position_ids, position_embeddings)
     query_states, key_states = apply_rotary(query_states, key_states, cos, sin)
+
+    # The release CUDA kernel is BF16-only. Quantized projection modules may
+    # return FP16 depending on the installed BitsAndBytes/Transformers build.
+    query_states = query_states.to(torch.bfloat16)
+    key_states = key_states.to(torch.bfloat16)
+    value_states = value_states.to(torch.bfloat16)
+
+    if _DHSA_QK_COLLECTOR is not None:
+        _DHSA_QK_COLLECTOR(
+            layer_idx=int(self.layer_idx),
+            query_states=query_states.detach(),
+            key_states=key_states.detach(),
+            value_states=value_states.detach(),
+            q_block_size=q_block_size,
+            k_block_size=k_block_size,
+            num_key_value_groups=int(self.num_key_value_groups),
+        )
     if cache is not None:
         cache_kwargs = {
             "sin": _slice_cache_position_embeddings(sin, original_q_len),
@@ -1430,6 +1845,8 @@ def _block_sparse_forward(
         cache_key_states = key_states[..., :original_q_len, :].contiguous()
         cache_value_states = value_states[..., :original_q_len, :].contiguous()
         _update_past_key_value(cache, cache_key_states, cache_value_states, self.layer_idx, cache_kwargs)
+
+    key_states_native = key_states
 
     # Expand KV heads -> full num_heads
     key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -1475,19 +1892,13 @@ def _block_sparse_forward(
     # This is the CRITICAL shape: (batch_size, num_blocksparse_heads, nrow, ncol)
     # base_blockmask = base_mask_1.unsqueeze(0).repeat(bsz, H, 1, 1)
 
-    if measure_kernel:
-        torch.cuda.synchronize()
-
-        # memory already in use when this layer starts
-        baseline_bytes = torch.cuda.memory_allocated()
-
-        # reset peak tracker so it starts from *current* usage
-        torch.cuda.reset_peak_memory_stats()
-
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-
+    mask_start = mask_end = attention_start = attention_end = None
+    if _DHSA_PROFILE_ENABLED:
+        mask_start = torch.cuda.Event(enable_timing=True)
+        mask_end = torch.cuda.Event(enable_timing=True)
+        attention_start = torch.cuda.Event(enable_timing=True)
+        attention_end = torch.cuda.Event(enable_timing=True)
+        mask_start.record()
 
     block_mask = _generate_sparsity_mask(
         query_states=query_states,
@@ -1495,7 +1906,14 @@ def _block_sparse_forward(
         topk_blocks=max(1, int((1.0 - sparsity) * (Lk // k_block_size))),
         q_block_size=q_block_size,
         k_block_size=k_block_size,
+        key_states_native=key_states_native,
+        num_key_value_groups=self.num_key_value_groups,
+        layer_idx=int(self.layer_idx),
     )  # (B, H, nrow, ncol)
+
+    if _DHSA_PROFILE_ENABLED:
+        mask_end.record()
+        attention_start.record()
 
     head_mask_type = torch.ones(H, dtype=torch.int32, device=device)  # all heads blocksparse
 
@@ -1520,6 +1938,12 @@ def _block_sparse_forward(
         q_block_size=q_block_size,
         k_block_size=k_block_size,
     )  # (B*L, H, D)
+
+    if _DHSA_PROFILE_ENABLED:
+        attention_end.record()
+        _DHSA_PROFILE_EVENTS.append(
+            (mask_start, mask_end, attention_start, attention_end)
+        )
 
     # Back to (B, L, H, D) -> (B, L, hidden_size)
     attn_output = out_unpad.view(bsz, Lq, H, D)
@@ -1552,6 +1976,7 @@ def _configure_block_sparse_attention_module(
     chunk_calculation: bool,
     o_proj_chunk_size: int,
 ) -> bool:
+    """Replace one attention module's forward method with block-sparse prefill."""
     if hasattr(module, "_original_forward"):
         return False
 

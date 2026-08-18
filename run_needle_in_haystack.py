@@ -16,6 +16,7 @@ import json
 import glob
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -23,9 +24,9 @@ from rouge_score import rouge_scorer
 
 from utils.helper import FirstTokenTimer, parse_bool, infer_model_provider, preprocess_text, SimpleQuantizedKVCache
 from utils.monkeypatch import (
-    SPARSITY_MASKS,
+    ATTENTION_METHODS,
     configure_DHSA as patch_DHSA,
-    validate_sparse_config,
+    validate_attention_config,
 )
 
 
@@ -206,6 +207,7 @@ class LLMNeedleHaystackTester:
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             quantization_config=bnb_config,
+            torch_dtype=torch.bfloat16,
             device_map="auto",
             attn_implementation=self.attn_implementation,
             low_cpu_mem_usage=True,
@@ -458,25 +460,27 @@ class LLMNeedleHaystackTester:
         self.run_test(args)
 
 
-def configure_DHSA(
+def configure_attention(
     tester: "LLMNeedleHaystackTester",
     density: float,
     q_block_size: int,
     k_block_size: int,
     sparsity_mask: str,
     chunk_calculation: bool,
+    predictor_checkpoint: Path | None,
 ) -> None:
-    sparsity = 1.0 - float(density)
-    patch_DHSA(
-        tester.model,
-        density=density,
-        q_block_size=q_block_size,
-        k_block_size=k_block_size,
-        sparsity_mask=sparsity_mask,
-        chunk_calculation=chunk_calculation,
-    )
+    if sparsity_mask != "full":
+        patch_DHSA(
+            tester.model,
+            density=density,
+            q_block_size=q_block_size,
+            k_block_size=k_block_size,
+            sparsity_mask=sparsity_mask,
+            chunk_calculation=chunk_calculation,
+            predictor_checkpoint=predictor_checkpoint,
+        )
 
-    tester.method = LOCAL_BLOCK_SPARSE_METHOD
+    tester.method = "FA2" if sparsity_mask == "full" else LOCAL_BLOCK_SPARSE_METHOD
     tester.DHSA_density = float(density)
     tester.DHSA_q_block_size = int(q_block_size)
     tester.DHSA_k_block_size = int(k_block_size)
@@ -736,8 +740,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--density",
         type=float,
-        default=0.125,
-        help="Fraction of key blocks kept per query block.",
+        default=1.0,
+        help="Fraction of key blocks kept per query block; use 1.0 for full.",
     )
     parser.add_argument(
         "--sparsity_ratio",
@@ -747,11 +751,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--sparsity-mask",
-        choices=SPARSITY_MASKS,
-        help="Sparse block selection function from the DHSA patch.",
+        choices=ATTENTION_METHODS,
+        default="full",
+        help="Attention method.",
     )
     parser.add_argument("--q-block-size", type=int, default=DEFAULT_BLOCK_SIZE, help="Query sparse block size.")
     parser.add_argument("--k-block-size", type=int, default=DEFAULT_BLOCK_SIZE, help="Key sparse block size.")
+    parser.add_argument("--predictor-checkpoint", type=Path)
     parser.add_argument(
         "--chunk_calculation",
         action="store_true",
@@ -790,7 +796,12 @@ def build_tester(args: argparse.Namespace) -> "LLMNeedleHaystackTester":
     density = 1.0 - args.sparsity_ratio if args.sparsity_ratio is not None else args.density
     q_block_size = args.q_block_size if args.q_block_size is not None else args.block_size
     k_block_size = args.k_block_size if args.k_block_size is not None else args.block_size
-    validate_sparse_config(density, q_block_size, k_block_size)
+    validate_attention_config(
+        args.sparsity_mask,
+        density,
+        q_block_size,
+        k_block_size,
+    )
 
     needle = args.needle
     retrieval_question = args.retrieval_question
@@ -824,13 +835,14 @@ def build_tester(args: argparse.Namespace) -> "LLMNeedleHaystackTester":
         "generation_latency_ms": None,
     }
 
-    configure_DHSA(
+    configure_attention(
         tester,
         density=density,
         q_block_size=q_block_size,
         k_block_size=k_block_size,
         sparsity_mask=args.sparsity_mask,
         chunk_calculation=args.chunk_calculation,
+        predictor_checkpoint=args.predictor_checkpoint,
     )
     override_tester_schedule(
         tester,

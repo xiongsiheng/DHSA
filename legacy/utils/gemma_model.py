@@ -774,10 +774,15 @@ def _compute_boundaries_for_training(
     # The predictor is not used.
     num_chunks = key_states.shape[-2] // self.config.block_size
     num_chunks = num_chunks * self.config.chunk_beta
-    instruction_tokens = self.instruction_tokens if self.instruction_tokens is not None else 64
+    instruction_tokens = getattr(self, "instruction_tokens", None) or 64
+    # Match query heads for GQA when computing attention-derived labels. Keep
+    # the original KV-head tensor unchanged for predictor features.
+    label_key_states = gemma2.modeling_gemma2.repeat_kv(
+        key_states, self.num_key_value_groups
+    )
     boundaries, ratios = label_boundaries(
         query_states,
-        key_states,
+        label_key_states,
         attention_mask,
         num_chunks=num_chunks,
         layer_idx=self.layer_idx,
@@ -808,7 +813,7 @@ def _compute_boundaries_for_inference(
     """
     num_chunks = key_states.shape[-2] // self.config.block_size
     num_chunks = num_chunks * self.config.chunk_beta
-    instruction_tokens = self.instruction_tokens if self.instruction_tokens is not None else 64
+    instruction_tokens = getattr(self, "instruction_tokens", None) or 64
     boundaries, ratios = predict_boundaries(
         self.boundary_predictor,
         key_states,
@@ -864,6 +869,9 @@ def gemma_sdpa_attn_forward_dhsa(
 
     # 3. Repeat K/V for Grouped-Query Attention (GQA)
     key_states_raw = copy.copy(key_states)
+    # Retain the unrepeated KV-head features for boundary predictor training.
+    if self.boundary_predictor is None:
+        self.key_states = key_states_raw.detach()
     key_states = gemma2.modeling_gemma2.repeat_kv(key_states, self.num_key_value_groups)
     value_states = gemma2.modeling_gemma2.repeat_kv(value_states, self.num_key_value_groups)
 
@@ -881,7 +889,13 @@ def gemma_sdpa_attn_forward_dhsa(
         # Compute boundaries if not already computed.
         self.boundaries = boundaries
         if self.boundaries is None:
-            if self.boundary_predictor is None:
+            preloaded_boundaries = getattr(self, "preloaded_boundaries", None)
+            if preloaded_boundaries is not None:
+                self.boundaries = preloaded_boundaries
+                self.ratios = self.preloaded_ratios
+                self.preloaded_boundaries = None
+                self.preloaded_ratios = None
+            elif self.boundary_predictor is None:
                 # Automatically label boundaries during training.
                 _compute_boundaries_for_training(self, query_states, key_states_raw, attention_mask)
             else:
@@ -905,7 +919,7 @@ def gemma_sdpa_attn_forward_dhsa(
             is_causal=is_causal,
             sliding_window_size=self.config.sliding_window if not (self.layer_idx % 2) else None,
             boundaries=boundaries,
-            instruction_tokens=self.instruction_tokens if self.instruction_tokens is not None else 64,
+            instruction_tokens=getattr(self, "instruction_tokens", None) or 64,
             loop_times=self.config.loop_times,
             pooling=self.config.chunk_representation_pooling,
             topk_indices=topk_indices_global if not bool(self.layer_idx % 2) else topk_indices_local
@@ -1108,8 +1122,13 @@ def gemma2model_forward_dhsa(
     # embed positions
     hidden_states = inputs_embeds
 
-    # create position embeddings to be shared across the decoder layers
-    position_embeddings = self.rotary_emb(hidden_states, position_ids)
+    # Transformers >= 4.46 shares RoPE at model level. In 4.45 (the
+    # repository's validated environment), each attention layer owns it.
+    position_embeddings = (
+        self.rotary_emb(hidden_states, position_ids)
+        if hasattr(self, "rotary_emb")
+        else None
+    )
 
     # Gemma2 downcasts the below to float16, causing sqrt(3072)=55.4256 to become 55.5
     # See https://github.com/huggingface/transformers/pull/29402
@@ -1187,7 +1206,7 @@ def gemma2model_forward_dhsa(
 def gemma2decoderlayer_forward_dhsa(
     self,
     hidden_states: torch.Tensor,
-    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
     attention_mask: torch.Tensor | None = None,
     position_ids: torch.LongTensor | None = None,
     past_key_value: Cache | None = None,
@@ -1228,6 +1247,9 @@ def gemma2decoderlayer_forward_dhsa(
 
     residual = hidden_states
     hidden_states = self.input_layernorm(hidden_states)
+
+    if position_embeddings is None:
+        position_embeddings = self.self_attn.rotary_emb(hidden_states, position_ids)
 
     # Self Attention
     hidden_states, self_attn_weights, boundaries, topk_indices_global, topk_indices_local = self.self_attn(

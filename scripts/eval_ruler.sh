@@ -1,2 +1,9 @@
-python3 eval_ruler.py \
-  --results_dir results_ruler/Llama-3.1-8B-Instruct_DHSA_vs_density_0.125_qbs128_kbs32/8192
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+
+results_dir="${1:-results_ruler}"
+shift $(( $# > 0 ? 1 : 0 ))
+
+dhsa_run_python eval_ruler.py --results_dir "${results_dir}" "$@"

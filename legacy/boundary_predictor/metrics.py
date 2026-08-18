@@ -22,6 +22,12 @@ def precision_recall_f1(
     - recall: float
     - f1: float
     """
+    if mask is None:
+        mask = torch.ones_like(probs, dtype=torch.bool)
+    else:
+        mask = mask.to(device=probs.device, dtype=torch.bool)
+
+    targets = targets.to(device=probs.device, dtype=torch.bool)
     pred_pos = (probs >= 0.5) & mask        # predicted 1s inside mask
     true_pos = targets & mask      # ground truth 1s inside mask
 

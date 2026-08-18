@@ -207,11 +207,11 @@ void run_mha_fwd_block(Flash_fwd_params &params, cudaStream_t stream, bool force
 #ifdef BLOCK_SPARSE_ATTN_LLAMA8B_BF16_CAUSAL_ONLY
     TORCH_CHECK(params.d == 128,
                 "This forward-only block_sparse_attn_cuda build supports only head_dim=128 forward");
-    FP16_SWITCH(!params.is_bf16, [&] {
-        BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-            run_mha_fwd_block_<elem_type, 128, Is_causal>(params, stream);
-        });
-    });
+    TORCH_CHECK(params.is_bf16,
+                "This forward-only block_sparse_attn_cuda build supports only BF16 forward");
+    TORCH_CHECK(params.is_causal,
+                "This forward-only block_sparse_attn_cuda build supports only causal forward");
+    run_mha_fwd_block_<cutlass::bfloat16_t, 128, true>(params, stream);
 #else
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {

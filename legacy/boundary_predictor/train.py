@@ -2,27 +2,31 @@
 Train a boundary predictor for each layer in a language model.
 """
 import json
+import sys
 from pathlib import Path
 from collections import defaultdict
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import torch
 import transformers
 import tqdm
 import numpy as np
 
-from utils.config import *  # e.g., Boundary_TRAINING_DIR
+from legacy.utils.config import Boundary_TRAINING_DIR, SparseAttnMethod
 
-from base_model_utils import (
+from legacy.boundary_predictor.base_model_utils import (
     reset_kv_cache, setup_lm_and_tokenizer, compute_ppl_with_full_response, load_labels
 )
-from preprocess_utils import is_foreign_language
-from dataset_utils import prepare_datasets
-from loss import focal_bce_loss, soft_label_transform
-from metrics import precision_recall_f1, topk_overlap
-from models import BoundarySimilarityAttn
+from legacy.boundary_predictor.preprocess_utils import is_foreign_language
+from legacy.boundary_predictor.dataset_utils import prepare_datasets
+from legacy.boundary_predictor.loss import focal_bce_loss, soft_label_transform
+from legacy.boundary_predictor.metrics import precision_recall_f1, topk_overlap
+from legacy.boundary_predictor.models import BoundarySimilarityAttn
 
 # argparse-based flags
-from flags_config import get_args
+from legacy.boundary_predictor.flags_config import get_args
 
 
 def print_settings(args):
@@ -72,14 +76,24 @@ def forward(
     probs = torch.sigmoid(logits)
 
     # Targets from ratios
-    ratios = ratios.clone()
+    ratios = torch.as_tensor(ratios, device=device, dtype=torch.float32).clone()
+    if ratios.ndim == 1:
+        ratios = ratios.unsqueeze(0)
+    if ratios.ndim != 2:
+        raise ValueError(f"Expected ratios with shape (L,) or (B, L), got {tuple(ratios.shape)}")
+    if ratios.shape[0] == 1 and batch > 1:
+        ratios = ratios.expand(batch, -1).clone()
+    if ratios.shape != (batch, seq_len):
+        raise ValueError(
+            f"Feature/ratio shape mismatch: features are {(batch, seq_len)}, "
+            f"ratios are {tuple(ratios.shape)}"
+        )
     ratios[ratios < 1.0] = 1.0
-    ratios = ratios.unsqueeze(0)  # (1, L)
     targets = soft_label_transform(ratios, alpha=alpha, beta=beta).to(device)
-    targets = targets >= 0.5  # binarize
+    targets = (targets >= 0.5).to(dtype=logits.dtype)  # binarize for BCE
 
     # Mask (ignore the first and last 2w tokens)
-    mask = torch.zeros((1, seq_len), dtype=torch.bool, device=device)
+    mask = torch.zeros((batch, seq_len), dtype=torch.bool, device=device)
     if 2 * window_size - 1 < seq_len - 2 * window_size:
         mask[:, 2 * window_size - 1 : seq_len - 2 * window_size] = 1
     return logits, probs, targets, mask
@@ -116,7 +130,7 @@ def evaluate(
             continue
         with label_file.open("r", encoding="utf-8") as f:
             label_data = json.load(f)
-        load_labels(lm, label_data)
+        load_labels(lm, label_data, num_layers=args.num_layers)
 
         success, _ = compute_ppl_with_full_response(
             lm,
@@ -134,13 +148,14 @@ def evaluate(
         # Evaluate boundary predictor on each layer
         for layer_idx in range(args.num_layers):
             feat = lm.model.layers[layer_idx].self_attn.key_states
-            ratios = lm.model.layers[layer_idx].self_attn.ratio
+            ratios = lm.model.layers[layer_idx].self_attn.ratios
 
-            logits, probs, targets, mask = forward(
-                feat, model, ratios,
-                alpha, beta,
-                window_size, lm.device
-            )
+            with torch.no_grad():
+                logits, probs, targets, mask = forward(
+                    feat, model, ratios,
+                    alpha, beta,
+                    window_size, lm.device
+                )
             prec, rec, f1 = precision_recall_f1(probs, targets, mask)
             _, overlap_rate = topk_overlap(
                 ratios=ratios,
@@ -169,8 +184,6 @@ def train(args):
     model_min_len = 512
 
     window_size = 4         # boundary predictor window size
-    channel_in = 1024       # input channel size
-
     alpha = 2.0             # soft label alpha
     beta = 2.0              # soft label beta
     beta = torch.log(torch.tensor(beta + 1e-6))  # as used in original code
@@ -183,12 +196,27 @@ def train(args):
     num_steps_save_ckpt = 2000
     topk = 500
 
-    train_dataset, val_dataset = prepare_datasets(seed=global_seed)
+    if args.method != SparseAttnMethod.dhsa.name:
+        raise ValueError("Boundary predictor training requires --method dhsa")
+    if args.dhsa_share_boundaries:
+        raise ValueError("Per-layer predictor training requires --no-dhsa-share-boundaries")
+
+    train_dataset, val_dataset = prepare_datasets(
+        dataset_name=args.dataset,
+        seed=global_seed,
+    )
     if not silent:
         print(f"Train size: {len(train_dataset)}, Validation size: {len(val_dataset)}")
 
     # Setup LM and tokenizer
     lm, tokenizer = setup_lm_and_tokenizer(args)
+
+    if args.num_layers > len(lm.model.layers):
+        raise ValueError(
+            f"Requested {args.num_layers} layers, but the model has {len(lm.model.layers)}"
+        )
+    head_dim = getattr(lm.config, "head_dim", lm.config.hidden_size // lm.config.num_attention_heads)
+    channel_in = lm.config.num_key_value_heads * head_dim
 
     model = BoundarySimilarityAttn(
         channel_in=channel_in,
@@ -203,6 +231,7 @@ def train(args):
 
     label_root = Path(Boundary_TRAINING_DIR) / "labels"
     metric_hist_path = Path(Boundary_TRAINING_DIR) / "metric_history.json"
+    metric_hist_path.parent.mkdir(parents=True, exist_ok=True)
     metric_hist = {}
     for epoch in range(max_epochs):
         if not silent:
@@ -246,7 +275,7 @@ def train(args):
                         label_data = json.load(f)
 
                     # Load labels into LM
-                    load_labels(lm, label_data)
+                    load_labels(lm, label_data, num_layers=args.num_layers)
 
                     success, _ = compute_ppl_with_full_response(
                         lm,
@@ -263,7 +292,7 @@ def train(args):
 
                         for layer_idx in range(args.num_layers):
                             feat = lm.model.layers[layer_idx].self_attn.key_states
-                            ratios = lm.model.layers[layer_idx].self_attn.ratio
+                            ratios = lm.model.layers[layer_idx].self_attn.ratios
 
                             logits, probs, targets, mask = forward(
                                 feat, model, ratios,

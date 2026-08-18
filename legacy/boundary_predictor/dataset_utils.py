@@ -2,7 +2,8 @@
 Dataset utilities for boundary predictor training.
 """
 import datasets
-from preprocess_utils import prepare_prompt_and_response_wrapper
+
+from .preprocess_utils import prepare_prompt_and_response_wrapper
 
 
 # Centralize all dataset information in a list of dictionaries.
@@ -77,6 +78,7 @@ def train_test_split(
 
 
 def prepare_datasets(
+    dataset_name: str | None = None,
     num_samples_train: int = 10000,
     num_samples_val: int = 100,
     test_size_ratio: float = 0.2,
@@ -97,8 +99,16 @@ def prepare_datasets(
   train_datasets, val_datasets = [], []
   final_columns = ["prompt", "response", "uid", "source"]
 
+  selected_configs = [
+      config for config in DATASET_CONFIGS
+      if dataset_name is None or config["source_name"] == dataset_name
+  ]
+  if not selected_configs:
+      available = ", ".join(config["source_name"] for config in DATASET_CONFIGS)
+      raise ValueError(f"Unknown dataset {dataset_name!r}. Available datasets: {available}")
+
   # Loop through the configuration list instead of hardcoding each dataset.
-  for config in DATASET_CONFIGS:
+  for config in selected_configs:
       # Load dataset using parameters from the config dictionary.
       # .get() gracefully handles optional keys like 'name' or 'data_files'.
       dataset = datasets.load_dataset(

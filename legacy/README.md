@@ -86,7 +86,7 @@ pip install -r requirements.txt
 
 ### Boundary Prediction
 
-You can directly download the predictor weights [here](https://huggingface.co/sxiong/DHSA).
+You can directly download the predictor weights [here](https://huggingface.co/sxiong/DHSA-Gemma2-2b-it-BF16).
 
 If you wish to train from scratch, you can download the following datasets: [Long Data Collections](https://huggingface.co/datasets/togethercomputer/Long-Data-Collections), [trivia QA](https://huggingface.co/datasets/mandarjoshi/trivia_qa), [ChatQA2](https://huggingface.co/datasets/nvidia/ChatQA2-Long-SFT-data), and use the training scripts provided in `boundary_predictor/`.
 

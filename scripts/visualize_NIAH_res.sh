@@ -1,5 +1,14 @@
-python visualize_needle_in_haystack.py \
-  --folder_path "results_NIAH/results/Llama-3.1-8B-Instruct_DHSA_vs_density_0.125_qbs128_kbs32" \
-  --model_name "llama-3.1-8b-instruct" \
-  --method "DHSA_vs" \
-  --density 0.125
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+
+folder_path="${1:-${RESULTS_DIR:-results_NIAH}}"
+shift $(( $# > 0 ? 1 : 0 ))
+
+dhsa_run_python visualize_needle_in_haystack.py \
+    --folder_path "${folder_path}" \
+    --model_name "${MODEL_LABEL:-llama-3.1-8b-instruct}" \
+    --method "${ATTENTION_METHOD:-DHSA_vs_optimized}" \
+    --density "${DENSITY:-0.125}" \
+    "$@"

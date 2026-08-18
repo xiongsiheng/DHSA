@@ -139,6 +139,7 @@ def _configure_attention_layers(
             model.model.layers[i].self_attn.boundary_predictor = predictor
             model.model.layers[i].self_attn.boundaries = None
             model.model.layers[i].self_attn.ratios = None
+            model.model.layers[i].self_attn.act_kv_seq_len = 0
 
 
 import os, time
